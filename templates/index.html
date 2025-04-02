@@ -1,0 +1,67 @@
+
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <title>WebRTC Audio Streaming</title>
+        </head>
+        <body>
+            <h1>WebRTC Audio Streaming</h1>
+            <button id="startButton">Start Streaming</button>
+            <button id="stopButton" disabled>Stop Streaming</button>
+            
+            <script>
+                const startButton = document.getElementById('startButton');
+                const stopButton = document.getElementById('stopButton');
+                
+                let pc;
+                
+                startButton.addEventListener('click', async () => {
+                    startButton.disabled = true;
+                    
+                    pc = new RTCPeerConnection();
+                    
+                    try {
+                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+                        stream.getTracks().forEach(track => pc.addTrack(track, stream));
+                        
+                        pc.oniceconnectionstatechange = () => {
+                            console.log('ICE connection state:', pc.iceConnectionState);
+                        };
+                        
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        
+                        const response = await fetch('/offer', {
+                            method: 'POST',
+                            headers: {
+                                'Content-Type': 'application/json'
+                            },
+                            body: JSON.stringify({
+                                sdp: pc.localDescription.sdp,
+                                type: pc.localDescription.type
+                            })
+                        });
+                        
+                        const answer = await response.json();
+                        await pc.setRemoteDescription(answer);
+                        
+                        stopButton.disabled = false;
+                    } catch (e) {
+                        console.error('Error:', e);
+                        startButton.disabled = false;
+                    }
+                });
+                
+                stopButton.addEventListener('click', () => {
+                    if (pc) {
+                        pc.close();
+                        pc = null;
+                    }
+                    
+                    startButton.disabled = false;
+                    stopButton.disabled = true;
+                });
+            </script>
+        </body>
+        </html>
+        
