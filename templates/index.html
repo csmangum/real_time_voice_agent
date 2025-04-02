@@ -93,14 +93,29 @@
                     }
                 });
                 
-                stopButton.addEventListener('click', () => {
+                stopButton.addEventListener('click', async () => {
                     if (pc) {
+                        console.log('Gracefully stopping connection...');
+                        stopButton.disabled = true;
+                        stopButton.textContent = 'Stopping...';
+                        
+                        // Add a short delay to ensure all audio gets transmitted
+                        await new Promise(resolve => {
+                            setTimeout(() => {
+                                console.log('Graceful shutdown delay complete');
+                                resolve();
+                            }, 3000);
+                        });
+                        
+                        // Now close the connection
                         pc.close();
                         pc = null;
+                        console.log('Connection closed');
                     }
                     
                     startButton.disabled = false;
                     stopButton.disabled = true;
+                    stopButton.textContent = 'Stop Streaming';
                 });
             </script>
         </body>

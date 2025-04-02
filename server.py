@@ -64,8 +64,8 @@ client_start_times: Dict[str, float] = {}  # Track when each client started reco
 client_session_info: Dict[str, Dict] = {}  # Additional session information
 
 # Constants for audio processing
-MAX_BACKFILL_GAP = 10  # Maximum number of frames to backfill for small gaps
-FRAME_INTERPOLATION = True  # Whether to use interpolation for missing frames
+MAX_BACKFILL_GAP = 3  # Reduced from 10 to 3 - Maximum number of frames to backfill for small gaps
+FRAME_INTERPOLATION = False  # Disabled frame interpolation to reduce processing overhead
 
 
 # Audio processing class
@@ -77,10 +77,22 @@ class AudioTrackProcessor(MediaStreamTrack):
         self.track = track
         self.client_id = client_id
         self.frame_count = 0
-        self.sample_rate = 48000  # Default, will be updated from frame
-        self.channels = 1  # Default, will be updated from frame
-        self.sample_width = 2  # Default (16-bit), will be updated from frame
-        self.format_detected = False
+        
+        # Initially use client-provided format but always verify with actual frame data
+        if client_id in audio_formats:
+            format_info = audio_formats[client_id]
+            self.sample_rate = format_info.get("sample_rate")
+            self.channels = format_info.get("channels", 1)
+            self.sample_width = format_info.get("sample_width", 2)
+            # We consider format as NOT detected - we'll verify from actual frames
+            self.format_detected = False
+            print(f"Starting with client-provided format for {client_id}: {format_info} (will verify)")
+        else:
+            # Otherwise start with no format until detected
+            self.sample_rate = None
+            self.channels = 1
+            self.sample_width = 2
+            self.format_detected = False
 
         # Add frame loss tracking
         self.missed_frames = 0
@@ -91,8 +103,87 @@ class AudioTrackProcessor(MediaStreamTrack):
 
         # Create a buffer for potentially missed frames
         self.last_valid_frame = None
-        self.frame_buffer = []  # Store recent frames for interpolation
         self.max_buffer_size = 20  # Number of recent frames to keep
+
+        print(f"Created AudioTrackProcessor for client {client_id}")
+
+    # Update format detection to be more robust
+    def _detect_and_update_format(self, frame):
+        format_changed = False
+        initial_detection = not self.format_detected
+        
+        # Try to detect sample rate from frame - this is crucial for correct playback speed
+        if hasattr(frame, "rate") and frame.rate is not None:
+            if self.sample_rate != frame.rate:
+                print(f"Detected sample rate: {frame.rate}Hz for client {self.client_id} (was: {self.sample_rate}Hz)")
+                self.sample_rate = frame.rate
+                format_changed = True
+        
+        # Detect channel layout
+        if hasattr(frame, "layout"):
+            layout_str = str(frame.layout)
+            channels = 2 if "stereo" in layout_str else 1
+            if self.channels != channels:
+                print(f"Detected {channels} channels for client {self.client_id} (was: {self.channels})")
+                self.channels = channels
+                format_changed = True
+
+        # Detect sample format and width
+        if hasattr(frame, "format"):
+            # Map PyAV format to byte width
+            format_to_width = {
+                "s16": 2,  # 16-bit
+                "s32": 4,  # 32-bit
+                "flt": 4,  # float
+                "dbl": 8,  # double
+                "u8": 1,  # 8-bit unsigned
+                "s8": 1,  # 8-bit signed
+            }
+            
+            if frame.format in format_to_width:
+                new_width = format_to_width[frame.format]
+                if self.sample_width != new_width:
+                    print(f"Detected {frame.format} format ({new_width} bytes) for client {self.client_id} (was: {self.sample_width})")
+                    self.sample_width = new_width
+                    format_changed = True
+        
+        # If we detected any format change or this is initial detection, always update audio_formats
+        if (format_changed or initial_detection) and self.sample_rate is not None:
+            # Update the actual detected format
+            detected_format = {
+                "sample_rate": self.sample_rate,
+                "channels": self.channels,
+                "sample_width": self.sample_width,
+                "format": getattr(frame, "format", "unknown"),
+                "detected": True,  # Mark this as a detected format
+            }
+            
+            # Save client-provided values for reference
+            if self.client_id in audio_formats and audio_formats[self.client_id].get("client_provided", False):
+                detected_format["original_client_rate"] = audio_formats[self.client_id].get("sample_rate")
+                detected_format["original_client_channels"] = audio_formats[self.client_id].get("channels")
+                detected_format["client_provided"] = True
+            
+            # Retain file path if it was already set
+            if self.client_id in audio_formats and "file_path" in audio_formats[self.client_id]:
+                detected_format["file_path"] = audio_formats[self.client_id]["file_path"]
+            
+            # Update the global format info
+            audio_formats[self.client_id] = detected_format
+            
+            # Format was successfully detected
+            self.format_detected = True
+            
+            # Log the update
+            if format_changed:
+                print(f"Updated audio format for client {self.client_id}: {detected_format}")
+                if initial_detection:
+                    print(f"Initial format detection complete")
+                else:
+                    print(f"Format change detected at frame {self.frame_count}")
+            return True
+            
+        return False
 
     async def recv(self):
         try:
@@ -107,129 +198,23 @@ class AudioTrackProcessor(MediaStreamTrack):
                 self.first_pts = frame.pts
                 if self.client_id in client_session_info:
                     client_session_info[self.client_id]["first_pts"] = self.first_pts
-                    client_session_info[self.client_id][
-                        "first_frame_time"
-                    ] = current_time
+                    client_session_info[self.client_id]["first_frame_time"] = current_time
+                    # Calculate initial latency
+                    initial_latency = (current_time - client_session_info[self.client_id].get("connection_timestamp", current_time)) * 1000
+                    print(f"First audio frame latency: {initial_latency:.2f}ms for client {self.client_id}")
 
-            # Track frame timestamps to detect gaps
+            # Track frame timestamps for minimal gap detection
             if self.last_pts is not None and hasattr(frame, "pts"):
-                # Calculate expected frames based on time elapsed and sample rate
-                expected_pts_diff = frame.samples  # Typically matches the frame size
+                # Simplified gap detection with less overhead
+                expected_pts_diff = frame.samples
                 actual_pts_diff = frame.pts - self.last_pts
 
-                # Detect unusually large gaps that indicate packet loss
-                if (
-                    actual_pts_diff > expected_pts_diff * 1.2
-                ):  # Be more aggressive about detecting gaps
-                    # Gap detected
-                    missed_frames = int(
-                        (actual_pts_diff - expected_pts_diff) / expected_pts_diff
-                    )
-                    time_gap = time_since_last
-
-                    # Don't count extremely large gaps as those are likely just PTS resets
-                    if missed_frames < 1000:  # Reasonable maximum for a gap
-                        self.missed_frames += missed_frames
-                        self.total_expected_frames += missed_frames
-                        print(
-                            f"Detected gap of ~{missed_frames} frames between PTS {self.last_pts} and {frame.pts} (time gap: {time_gap:.3f}s)"
-                        )
-
-                        # Only try to fill smaller gaps - large gaps would create too much artificial audio
-                        if (
-                            missed_frames <= MAX_BACKFILL_GAP
-                            and self.last_valid_frame is not None
-                            and self.client_id in audio_frames
-                        ):
-                            # Use interpolation if enabled and we have enough frames in our buffer
-                            if FRAME_INTERPOLATION and len(self.frame_buffer) >= 2:
-                                # Create interpolated frames to fill the gap
-                                print(
-                                    f"Interpolating {missed_frames} frames to fill the gap"
-                                )
-                                for i in range(missed_frames):
-                                    # Simple linear interpolation between frames
-                                    # For more complex audio, more sophisticated interpolation would be needed
-                                    position = (i + 1) / (
-                                        missed_frames + 1
-                                    )  # Relative position in the gap
-                                    try:
-                                        # Use the last two frames as reference points
-                                        last_frame_data = self._extract_audio_data(
-                                            self.frame_buffer[-1]
-                                        )
-                                        prev_frame_data = self._extract_audio_data(
-                                            self.frame_buffer[-2]
-                                        )
-
-                                        if (
-                                            last_frame_data
-                                            and prev_frame_data
-                                            and len(last_frame_data)
-                                            == len(prev_frame_data)
-                                        ):
-                                            # Linear interpolation between the two frames
-                                            interp_frame = bytearray(
-                                                len(last_frame_data)
-                                            )
-                                            for j in range(
-                                                0, len(last_frame_data), 2
-                                            ):  # 2 bytes per sample for 16-bit
-                                                if j + 1 < len(last_frame_data):
-                                                    # Get samples from both frames as integers
-                                                    prev_sample = int.from_bytes(
-                                                        prev_frame_data[j : j + 2],
-                                                        byteorder="little",
-                                                        signed=True,
-                                                    )
-                                                    last_sample = int.from_bytes(
-                                                        last_frame_data[j : j + 2],
-                                                        byteorder="little",
-                                                        signed=True,
-                                                    )
-                                                    # Interpolate
-                                                    interp_sample = int(
-                                                        prev_sample * (1 - position)
-                                                        + last_sample * position
-                                                    )
-                                                    # Convert back to bytes
-                                                    interp_frame[j : j + 2] = (
-                                                        interp_sample.to_bytes(
-                                                            2,
-                                                            byteorder="little",
-                                                            signed=True,
-                                                        )
-                                                    )
-
-                                            audio_frames[self.client_id].append(
-                                                bytes(interp_frame)
-                                            )
-                                    except Exception as e:
-                                        print(
-                                            f"Interpolation error: {e} - falling back to duplicating frames"
-                                        )
-                                        # If interpolation fails, fall back to duplicating the last frame
-                                        fill_data = self._extract_audio_data(
-                                            self.last_valid_frame
-                                        )
-                                        if fill_data:
-                                            audio_frames[self.client_id].append(
-                                                fill_data
-                                            )
-                            else:
-                                # Extract data from the last valid frame
-                                fill_data = self._extract_audio_data(
-                                    self.last_valid_frame
-                                )
-                                if fill_data:
-                                    # Add it for each missed frame (up to the limit)
-                                    fill_count = min(missed_frames, MAX_BACKFILL_GAP)
-                                    for _ in range(fill_count):
-                                        audio_frames[self.client_id].append(fill_data)
-
-                                    print(
-                                        f"Added {fill_count} fill frames to compensate for gap"
-                                    )
+                # Only detect significant gaps to reduce overhead
+                if actual_pts_diff > expected_pts_diff * 2:
+                    self.missed_frames += int((actual_pts_diff - expected_pts_diff) / expected_pts_diff)
+                    # Only log major gap issues
+                    if self.frame_count % 100 == 0 or actual_pts_diff > expected_pts_diff * 5:
+                        print(f"Detected significant gap between PTS {self.last_pts} and {frame.pts}")
 
             if hasattr(frame, "pts"):
                 self.last_pts = frame.pts
@@ -238,136 +223,46 @@ class AudioTrackProcessor(MediaStreamTrack):
             # Update client activity timestamp
             client_last_activity[self.client_id] = time.time()
 
-            # Update format information if available
-            if not self.format_detected:
-                if hasattr(frame, "rate") and frame.rate is not None:
-                    self.sample_rate = frame.rate
+            # Always check the format for the first 10 frames to ensure accurate detection
+            if self.frame_count <= 10:
+                self._detect_and_update_format(frame)
+            # Then check occasionally for any changes (WebRTC can change format mid-stream)
+            elif self.frame_count % 100 == 0:
+                self._detect_and_update_format(frame)
 
-                if hasattr(frame, "layout"):
-                    # Handle layout as string or object
-                    layout_str = str(frame.layout)
-                    self.channels = 2 if "stereo" in layout_str else 1
-
-                if hasattr(frame, "format"):
-                    # Map PyAV format to byte width
-                    format_to_width = {
-                        "s16": 2,  # 16-bit
-                        "s32": 4,  # 32-bit
-                        "flt": 4,  # float
-                        "dbl": 8,  # double
-                        "u8": 1,  # 8-bit unsigned
-                        "s8": 1,  # 8-bit signed
-                    }
-                    if frame.format in format_to_width:
-                        self.sample_width = format_to_width[frame.format]
-
-                # Store format info for this client
-                audio_formats[self.client_id] = {
-                    "sample_rate": self.sample_rate,
-                    "channels": self.channels,
-                    "sample_width": self.sample_width,
-                    "format": getattr(frame, "format", "unknown"),
-                }
-
-                print(
-                    f"Audio format for client {self.client_id}: {audio_formats[self.client_id]}"
-                )
-                self.format_detected = True
-
-            # Convert frame to bytes and store
+            # Optimize audio extraction for faster handling
             if self.client_id in audio_frames:
-                # Extract audio data using the most appropriate method
-                pcm_bytes = self._extract_audio_data(frame)
-
-                if pcm_bytes:
-                    # Add to main recording buffer
-                    audio_frames[self.client_id].append(pcm_bytes)
-
-                    # Update the frame buffer for future interpolation
-                    self.frame_buffer.append(frame)
-                    # Keep buffer size limited
-                    if len(self.frame_buffer) > self.max_buffer_size:
-                        self.frame_buffer.pop(0)
-
-                    self.last_valid_frame = (
-                        frame  # Store this frame for potential gap filling
-                    )
-
-                    # Log occasionally to avoid flooding
-                    if self.frame_count % 100 == 0:
-                        total_kb = (
-                            sum(len(b) for b in audio_frames[self.client_id]) / 1024
-                        )
-                        audio_sec = (
-                            len(audio_frames[self.client_id])
-                            * len(pcm_bytes)
-                            / (self.sample_width * self.channels * self.sample_rate)
-                        )
-                        loss_percent = (
-                            self.missed_frames / max(1, self.total_expected_frames)
-                        ) * 100
-                        print(
-                            f"Processed {self.frame_count} frames for client {self.client_id} - Total: {total_kb:.1f} KB ({audio_sec:.1f} sec)"
-                        )
-                        print(
-                            f"Estimated frame loss: {self.missed_frames}/{self.total_expected_frames} frames ({loss_percent:.1f}%)"
-                        )
-                        # Calculate real-time elapsed since first frame
-                        if (
-                            self.first_pts is not None
-                            and "first_frame_time"
-                            in client_session_info.get(self.client_id, {})
-                        ):
-                            elapsed_real = (
-                                time.time()
-                                - client_session_info[self.client_id][
-                                    "first_frame_time"
-                                ]
-                            )
-                            print(
-                                f"Real time elapsed: {elapsed_real:.1f}s vs recorded time: {audio_sec:.1f}s (ratio: {audio_sec/elapsed_real:.2f})"
-                            )
-                elif self.frame_count % 100 == 0:
-                    print(
-                        f"Warning: Could not extract audio data from frame {self.frame_count}"
-                    )
+                # Fast path direct plane access
+                try:
+                    if hasattr(frame, "planes") and len(frame.planes) > 0:
+                        pcm_bytes = bytes(frame.planes[0])
+                    else:
+                        pcm_bytes = self._extract_audio_data(frame)
+                        
+                    if pcm_bytes:
+                        # Add to main recording buffer
+                        audio_frames[self.client_id].append(pcm_bytes)
+                        self.last_valid_frame = frame
+                        
+                        # Reduced logging frequency
+                        if self.frame_count % 500 == 0:
+                            total_kb = sum(len(b) for b in audio_frames[self.client_id]) / 1024
+                            audio_sec = len(audio_frames[self.client_id]) * len(pcm_bytes) / (self.sample_width * self.channels * self.sample_rate or 48000)
+                            print(f"Processed {self.frame_count} frames ({total_kb:.1f} KB, {audio_sec:.1f} sec) for client {self.client_id}")
+                except Exception as e:
+                    if self.frame_count % 500 == 0:  # Reduced error logging
+                        print(f"Frame processing error: {str(e)}")
 
             return frame
 
         except MediaStreamError:
-            print(
-                f"MediaStreamError: Track ended for client {self.client_id} - this is normal when connection ends"
-            )
-
-            # Let the track.on("ended") handler handle the cleanup
-            # to avoid race conditions with duplicate cleanup attempts
-            print(f"Leaving cleanup to the track.on('ended') handler...")
-
-            # Re-raise to signal track end to aiortc internals
+            print(f"MediaStreamError: Track ended for client {self.client_id}")
             raise
-
         except asyncio.CancelledError:
-            print(
-                f"Track processing cancelled for client {self.client_id} - normal during shutdown"
-            )
+            print(f"Track processing cancelled for client {self.client_id}")
             raise
-
-        except ConnectionResetError:
-            print(
-                f"Connection reset for client {self.client_id} - client likely disconnected"
-            )
-            raise
-
         except Exception as e:
-            import traceback
-
-            error_details = (
-                str(e) if str(e) else "Empty error message - likely track ended"
-            )
-            print(f"Error in recv for client {self.client_id}: {error_details}")
-            print(f"Error type: {type(e).__name__}")
-            print(f"Traceback: {traceback.format_exc()}")
-            # Re-raise to ensure proper error handling
+            print(f"Error in recv for client {self.client_id}: {str(e)}")
             raise
 
     def _extract_audio_data(self, frame) -> Optional[bytes]:
@@ -432,6 +327,7 @@ class AudioTrackProcessor(MediaStreamTrack):
 class OfferModel(BaseModel):
     sdp: str
     type: str
+    audio_format: dict = None  # Optional dict for audio format parameters
 
 
 class IceCandidateModel(BaseModel):
@@ -458,12 +354,17 @@ async def offer(params: OfferModel):
     client_last_activity[client_id] = time.time()  # Set initial activity time
     client_start_times[client_id] = time.time()  # Record when this client started
 
+    # Log connection start with timestamp for latency tracking
+    start_timestamp = time.time()
+    print(f"Connection request received at {start_timestamp:.6f} for client {client_id}")
+
     # Initialize session info
     client_session_info[client_id] = {
         "start_time": time.time(),
         "first_frame_time": None,
         "first_pts": None,
         "sdp_offer": params.sdp,  # Store original SDP for debugging
+        "connection_timestamp": start_timestamp,
     }
 
     # Prepare audio file path
@@ -473,12 +374,21 @@ async def offer(params: OfferModel):
 
     # Initialize frame storage and format info
     audio_frames[client_id] = []
-    audio_formats[client_id] = {
-        "sample_rate": 48000,
-        "channels": 1,
-        "sample_width": 2,
-        "format": "s16",
-    }
+    
+    # Use client-provided format if available, otherwise use defaults
+    if params.audio_format:
+        audio_formats[client_id] = params.audio_format
+        audio_formats[client_id]["client_provided"] = True  # Mark as explicitly provided
+        print(f"Using client-provided audio format: {params.audio_format}")
+    else:
+        audio_formats[client_id] = {
+            "sample_rate": 48000,
+            "channels": 1,
+            "sample_width": 2,
+            "format": "s16",
+            "client_provided": False  # Mark as default
+        }
+        print(f"Client didn't provide format, using defaults: {audio_formats[client_id]}")
 
     # Store the audio file path for later use in cleanup
     audio_formats[client_id]["file_path"] = audio_file
@@ -489,20 +399,26 @@ async def offer(params: OfferModel):
 
     @pc.on("track")
     def on_track(track):
-        print(f"Track received: {track.kind} from client {client_id}")
+        track_receive_time = time.time()
+        print(f"Track received: {track.kind} from client {client_id} at {track_receive_time:.6f}")
+        print(f"Track latency: {(track_receive_time - start_timestamp)*1000:.2f}ms")
+        
         if track.kind == "audio":
             local_track = AudioTrackProcessor(track, client_id)
+            
+            # Add track with high priority for latency optimization
             pc.addTrack(local_track)
             recorder.addTrack(local_track)
-            print(f"Added audio track to recorder for client {client_id}")
+            print(f"Added audio track to recorder for client {client_id} with high priority")
 
         @track.on("ended")
         async def on_ended():
             print(f"Track ended for client {client_id}")
             # Explicitly save audio on track end
             try:
-                # Use a small delay to allow any pending frames to be processed
-                await asyncio.sleep(0.5)
+                # Add a longer delay to allow all pending frames to be processed
+                print(f"Waiting for additional audio frames to arrive (3 seconds)...")
+                await asyncio.sleep(3.0)
 
                 if client_id in pcs:  # Only cleanup if client still exists
                     # Check if we have enough audio frames to save
@@ -541,6 +457,9 @@ async def offer(params: OfferModel):
             print(f"Client {client_id} successfully connected")
         elif state in ["failed", "closed"]:
             print(f"Client {client_id} connection {state}, cleaning up")
+            # Add delay before cleanup to ensure all frames are processed
+            print(f"Waiting for final audio frames to be processed (3 seconds)...")
+            await asyncio.sleep(3.0)
             if client_id in pcs:  # Only cleanup if client still exists
                 await cleanup(client_id)
         elif state == "disconnected":
@@ -698,24 +617,92 @@ async def cleanup(client_id):
                     main_path = f"recordings/main_{timestamp}_{client_id[-8:]}.wav"
                     frames = audio_frames[client_id]
 
-                    # Calculate duration based on frames
-                    format_info = audio_formats.get(
-                        client_id,
-                        {"sample_rate": 48000, "channels": 1, "sample_width": 2},
-                    )
+                    # Ensure format info is set with correct values
+                    if client_id in audio_formats:
+                        format_info = audio_formats[client_id]
+                    else:
+                        format_info = {"sample_rate": 48000, "channels": 1, "sample_width": 2}
+                    
+                    # Get format parameters from detected values
                     sample_rate = format_info.get("sample_rate", 48000)
-                    frame_size = len(frames[0]) if frames else 0
-                    bytes_per_sample = format_info.get("sample_width", 2)
+                    if sample_rate is None or sample_rate <= 0:
+                        print(f"Warning: Invalid sample rate detected: {sample_rate}, using 16000Hz")
+                        sample_rate = 16000
+                        
                     channels = format_info.get("channels", 1)
-
+                    if channels <= 0:
+                        channels = 1
+                        
+                    bytes_per_sample = format_info.get("sample_width", 2)
+                    if bytes_per_sample <= 0:
+                        bytes_per_sample = 2
+                    
+                    # Log where format came from
+                    format_source = "detected from frames"
+                    if format_info.get("detected", False):
+                        format_source = "detected from actual audio frames"
+                    elif format_info.get("client_provided", False):
+                        format_source = "explicitly provided by client but overridden"
+                    
+                    print(f"Creating WAV with format: {sample_rate}Hz, {channels} channels, {bytes_per_sample} bytes per sample")
+                    print(f"Format was {format_source}")
+                    
+                    # If we have both client-provided and detected formats that differ, show the difference
+                    if format_info.get("client_provided", False) and format_info.get("detected", False):
+                        original_rate = format_info.get("original_client_rate")
+                        if original_rate and original_rate != sample_rate:
+                            print(f"WebRTC changed sample rate: client sent {original_rate}Hz but WebRTC delivered {sample_rate}Hz")
+                        
+                        original_channels = format_info.get("original_client_channels")
+                        if original_channels and original_channels != channels:
+                            print(f"WebRTC changed channels: client sent {original_channels} but WebRTC delivered {channels}")
+                    
+                    # Calculate frame size (bytes)
+                    frame_size = len(frames[0]) if frames else 0
+                    
                     # Calculate samples per frame
                     samples_per_frame = (
-                        frame_size / (bytes_per_sample * channels) if frame_size else 0
+                        frame_size / (bytes_per_sample * channels) if frame_size and bytes_per_sample and channels else 0
                     )
 
                     # Expected duration based on audio data
                     frame_count = len(frames)
-                    audio_duration = (frame_count * samples_per_frame) / sample_rate
+                    audio_duration = (frame_count * samples_per_frame) / sample_rate if sample_rate > 0 else 0
+                    
+                    # Get the actual session duration for comparison
+                    if client_id in client_start_times:
+                        actual_duration = time.time() - client_start_times[client_id]
+                        print(f"Session actual duration: {actual_duration:.1f}s vs calculated audio duration: {audio_duration:.1f}s")
+                        
+                        # Check for significant timing mismatch (more than 20% difference)
+                        if actual_duration > 0 and abs(actual_duration - audio_duration) / actual_duration > 0.2:
+                            print(f"WARNING: Significant timing mismatch detected! Received audio is {audio_duration/actual_duration*100:.1f}% of real-time duration")
+                            
+                            # Check if this is likely due to WebRTC resampling
+                            webrtc_resampled = False
+                            if format_info.get("client_provided", False) and format_info.get("detected", False):
+                                original_rate = format_info.get("original_client_rate")
+                                if original_rate and original_rate != sample_rate:
+                                    ratio = sample_rate / original_rate
+                                    expected_ratio = actual_duration / audio_duration
+                                    # If the ratios are close, it's likely just WebRTC resampling
+                                    if abs(ratio - expected_ratio) / expected_ratio < 0.1:
+                                        print(f"Timing mismatch explained by WebRTC resampling: {original_rate}Hz → {sample_rate}Hz")
+                                        webrtc_resampled = True
+                            
+                            if not webrtc_resampled:
+                                print(f"This may indicate timing or buffering issues between client and server")
+                                
+                                # Calculate correction factor for sample rate
+                                if audio_duration > 0 and actual_duration > 0:
+                                    correction_factor = actual_duration / audio_duration
+                                    # Only apply correction if it's significant but not extreme
+                                    if 0.5 < correction_factor < 5.0:
+                                        corrected_sample_rate = int(sample_rate * correction_factor)
+                                        print(f"Applying sample rate correction: {sample_rate}Hz -> {corrected_sample_rate}Hz (factor: {correction_factor:.2f})")
+                                        sample_rate = corrected_sample_rate
+                                    else:
+                                        print(f"Correction factor too extreme ({correction_factor:.2f}), not applying. Check client/server sync.")
 
                     print(
                         f"Audio stats: {frame_count} frames, {samples_per_frame} samples/frame"
@@ -723,54 +710,7 @@ async def cleanup(client_id):
                     print(
                         f"Session duration: {duration:.1f}s, audio duration: {audio_duration:.1f}s"
                     )
-
-                    # Determine if we're missing audio at the end based on session vs audio duration
-                    if (
-                        duration and audio_duration < duration * 0.95
-                    ):  # More than 5% shorter
-                        missing_seconds = duration - audio_duration
-                        print(
-                            f"Audio appears to be {missing_seconds:.1f}s shorter than the session - adding compensation"
-                        )
-
-                        # Add compensation silence at the end
-                        if frame_size > 0:
-                            missing_frames = int(
-                                (missing_seconds * sample_rate) / samples_per_frame
-                            )
-                            print(
-                                f"Adding {missing_frames} silence frames ({missing_seconds:.1f}s) to match session duration"
-                            )
-                            for _ in range(missing_frames):
-                                frames.append(b"\x00" * frame_size)
-
-                    # Add a short amount of silence at the end to prevent abrupt cutoffs
-                    # Get a representative frame to determine format
-                    if frames:
-                        frame_size = len(frames[0])
-                        # Add 0.5 seconds of silence at the end in all cases
-                        silence_size = int(
-                            0.5 * sample_rate * channels * bytes_per_sample
-                        )
-                        silence_frames = silence_size // frame_size + 1
-
-                        print(
-                            f"Adding {silence_frames} frames of silence ({silence_size} bytes) at the end of recording"
-                        )
-                        for _ in range(silence_frames):
-                            frames.append(b"\x00" * frame_size)
-
-                    total_size = sum(len(frame) for frame in frames)
-                    final_duration = (len(frames) * samples_per_frame) / sample_rate
-
-                    print(
-                        f"Saving primary recording with {len(frames)} frames ({total_size/1024:.1f} KB) to {main_path}"
-                    )
-                    print(f"Using format: {format_info}")
-                    print(
-                        f"Final audio duration: {final_duration:.1f}s ({100*final_duration/duration:.1f}% of session duration)"
-                    )
-
+                    
                     # Normalize frame lengths - ensure all frames have the same size
                     # This fixes potential audio corruption if frame sizes vary
                     if frames:
@@ -798,31 +738,15 @@ async def cleanup(client_id):
 
                     # Write raw audio to wav file with detected format
                     with wave.open(main_path, "wb") as wf:
-                        wf.setnchannels(format_info["channels"])
-                        wf.setsampwidth(format_info["sample_width"])
-                        wf.setframerate(format_info["sample_rate"])
+                        wf.setnchannels(channels)
+                        wf.setsampwidth(bytes_per_sample)
+                        wf.setframerate(sample_rate)  # This is crucial for correct playback speed
                         wf.writeframes(b"".join(frames))
 
                     file_size = os.path.getsize(main_path)
                     print(
-                        f"Primary audio saved to {main_path} ({file_size/1024:.1f} KB)"
+                        f"Primary audio saved to {main_path} ({file_size/1024:.1f} KB), {audio_duration:.1f}s at {sample_rate}Hz"
                     )
-
-                    # Only create fallback if original MediaRecorder fails
-                    main_recorder_successful = (
-                        audio_file
-                        and os.path.exists(audio_file)
-                        and os.path.getsize(audio_file) > 1000
-                    )
-
-                    if not main_recorder_successful:
-                        print(
-                            f"Original MediaRecorder recording failed, keeping the new recording as primary"
-                        )
-                    else:
-                        print(
-                            f"Both recordings successful - compare to see which has better quality"
-                        )
 
                 except Exception as e:
                     import traceback
@@ -830,6 +754,7 @@ async def cleanup(client_id):
                     print(f"Error saving primary audio: {e}")
                     print(f"Error type: {type(e).__name__}")
                     print(f"Traceback: {traceback.format_exc()}")
+                    
             else:
                 print(f"No frames to save for client {client_id}")
 
@@ -967,14 +892,29 @@ if __name__ == "__main__":
                     }
                 });
                 
-                stopButton.addEventListener('click', () => {
+                stopButton.addEventListener('click', async () => {
                     if (pc) {
+                        console.log('Gracefully stopping connection...');
+                        stopButton.disabled = true;
+                        stopButton.textContent = 'Stopping...';
+                        
+                        // Add a short delay to ensure all audio gets transmitted
+                        await new Promise(resolve => {
+                            setTimeout(() => {
+                                console.log('Graceful shutdown delay complete');
+                                resolve();
+                            }, 3000);
+                        });
+                        
+                        // Now close the connection
                         pc.close();
                         pc = null;
+                        console.log('Connection closed');
                     }
                     
                     startButton.disabled = false;
                     stopButton.disabled = true;
+                    stopButton.textContent = 'Stop Streaming';
                 });
             </script>
         </body>

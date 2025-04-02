@@ -24,7 +24,7 @@ class PyAudioStreamTrack(MediaStreamTrack):
     kind = "audio"
 
     def __init__(
-        self, sample_rate=48000, channels=1, frame_size=960, save_local_recording=True
+        self, sample_rate=16000, channels=1, frame_size=480, save_local_recording=True
     ):
         super().__init__()
         self.sample_rate = sample_rate
@@ -56,9 +56,16 @@ class PyAudioStreamTrack(MediaStreamTrack):
             f"PyAudio stream opened for microphone capture: {sample_rate}Hz, {channels} channels, {frame_size} frame size"
         )
 
-        # Start a separate task to capture audio directly
-        self.recording = True
-        self.record_task = asyncio.create_task(self._record_audio())
+        # Initialize recording flag but don't start yet
+        self.recording = False
+        self.record_task = None
+
+    def start_recording(self):
+        """Start the audio recording process"""
+        if not self.recording:
+            self.recording = True
+            self.record_task = asyncio.create_task(self._record_audio())
+            print("Audio recording started")
 
     async def _record_audio(self):
         """Continuously record audio in background"""
@@ -171,9 +178,9 @@ class PyAudioStreamTrack(MediaStreamTrack):
     def stop(self):
         # Stop recording task
         self.recording = False
-
-        # Save the collected audio to a WAV file
-        if self.frames and self.save_local_recording:
+        
+        # Only try to save frames if we actually recorded something
+        if self.record_task and self.frames and self.save_local_recording:
             client_id = time.strftime("%Y%m%d-%H%M%S")
             filename = f"recordings/client_audio_{client_id}.wav"
 
@@ -204,6 +211,8 @@ class PyAudioStreamTrack(MediaStreamTrack):
                 print(f"Error saving audio: {e}")
         elif not self.save_local_recording:
             print("Local recording disabled - no client-side file saved")
+        elif not self.frames:
+            print("No audio frames captured - recording may never have started")
         else:
             print("No audio frames captured!")
 
@@ -213,6 +222,15 @@ class PyAudioStreamTrack(MediaStreamTrack):
         if self.p:
             self.p.terminate()
         print("PyAudio stream closed")
+
+    async def drain_buffers(self, timeout=2.0):
+        """Wait for all buffered audio to be sent"""
+        print(f"Draining audio buffers for up to {timeout} seconds...")
+        start_time = time.time()
+        while not self.audio_buffer.empty() and time.time() - start_time < timeout:
+            await asyncio.sleep(0.1)
+        print(f"Buffer drain completed after {time.time() - start_time:.2f} seconds")
+        return
 
 
 async def wait_for_enter():
@@ -236,7 +254,7 @@ async def wait_for_enter():
     print("Starting audio streaming...")
 
 
-async def run_client(server_url, max_duration=60, save_local_recording=True):
+async def run_client(server_url, max_duration=60, save_local_recording=True, sample_rate=16000):
     # Wait for user to press Enter before starting
     await wait_for_enter()
 
@@ -249,7 +267,7 @@ async def run_client(server_url, max_duration=60, save_local_recording=True):
     else:
         print("Client-side recording disabled - relying on server recording only")
 
-    # Create peer connection with STUN servers
+    # Create optimized peer connection configuration
     config = RTCConfiguration(
         iceServers=[
             RTCIceServer(
@@ -273,6 +291,9 @@ async def run_client(server_url, max_duration=60, save_local_recording=True):
             print("Connection failed - may need to restart client")
         elif pc.connectionState == "connected":
             print("Successfully connected to the server")
+            # Start recording when connection is established
+            audio_track.start_recording()
+            print("Audio recording started now that connection is established")
 
     # Set up ICE candidate handler
     @pc.on("icecandidate")
@@ -301,12 +322,26 @@ async def run_client(server_url, max_duration=60, save_local_recording=True):
     # Create a stop event for graceful shutdown
     stop_event = asyncio.Event()
 
-    # Create audio track from microphone
-    audio_track = PyAudioStreamTrack(save_local_recording=save_local_recording)
+    # Create audio track from microphone with optimized parameters
+    audio_track = PyAudioStreamTrack(
+        sample_rate=sample_rate, 
+        frame_size=480,  # Reduced frame size for lower latency
+        save_local_recording=save_local_recording
+    )
+    
+    # Add track with high priority for better latency
     pc.addTrack(audio_track)
 
     # Create offer
     offer = await pc.createOffer()
+    
+    # Log SDP for debugging WebRTC audio formats
+    sdp_lines = offer.sdp.split('\n')
+    print("Analyzing WebRTC SDP offer for audio format:")
+    audio_lines = [line for line in sdp_lines if "a=rtpmap:109" in line or "opus" in line]
+    for line in audio_lines:
+        print(f"  SDP: {line}")
+    
     await pc.setLocalDescription(offer)
 
     # Send offer to server
@@ -314,10 +349,25 @@ async def run_client(server_url, max_duration=60, save_local_recording=True):
         print(f"Connecting to server at {server_url}...")
         print("Sending WebRTC offer to server...")
 
+        # Add audio format information to the request
+        audio_format = {
+            "sample_rate": sample_rate,
+            "channels": audio_track.channels,
+            "sample_width": 2,  # 2 bytes for 'int16'
+            "format": "s16"
+        }
+        
+        print(f"Sending audio format info to server: {audio_format}")
+        print("Note: WebRTC may resample/convert this audio during transmission")
+        
         try:
             response = requests.post(
                 f"{server_url}/offer",
-                json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
+                json={
+                    "sdp": pc.localDescription.sdp, 
+                    "type": pc.localDescription.type,
+                    "audio_format": audio_format  # Include format parameters
+                },
                 timeout=5,  # Add timeout to prevent hanging indefinitely
             )
             response.raise_for_status()
@@ -382,6 +432,28 @@ async def run_client(server_url, max_duration=60, save_local_recording=True):
     finally:
         # Cleanup
         print("Closing connection...")
+        
+        # Add graceful shutdown with delay to ensure all audio is transmitted
+        print("Waiting for all audio to be transmitted (3 seconds)...")
+        # First stop recording but don't close stream yet
+        if audio_track.recording:
+            audio_track.recording = False
+            if audio_track.record_task:
+                try:
+                    # Wait for recording task to finish
+                    await asyncio.wait_for(audio_track.record_task, timeout=1.0)
+                except asyncio.TimeoutError:
+                    print("Timeout waiting for recording task to finish")
+                
+            # Wait for any buffered audio to be sent
+            await audio_track.drain_buffers(timeout=2.0)
+            
+            # Add additional delay to ensure server processing
+            # Increased from 2.0 to 3.0 to match server-side delay
+            await asyncio.sleep(3.0)
+            print("Graceful shutdown delay completed")
+        
+        # Now fully stop the audio track
         audio_track.stop()
 
         # Ensure proper connection closure
@@ -431,10 +503,16 @@ if __name__ == "__main__":
         action="store_true",
         help="Disable audio recording on client side",
     )
+    parser.add_argument(
+        "--sample-rate",
+        type=int,
+        default=16000,
+        help="Audio sample rate (default: 16000, reduced from 48000 for lower latency)",
+    )
     args = parser.parse_args()
 
     # Run the client
     try:
-        asyncio.run(run_client(args.server, args.duration, not args.no_save_local))
+        asyncio.run(run_client(args.server, args.duration, not args.no_save_local, args.sample_rate))
     except KeyboardInterrupt:
         print("Program terminated by user")

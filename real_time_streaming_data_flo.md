@@ -111,3 +111,53 @@ sequenceDiagram
 - **Cleanup**: Resources are properly released when connections end
 
 This comprehensive flow enables low-latency, secure audio streaming from the client microphone to server processing with minimal delay and robust error handling. 
+
+## Usage Guide
+
+### Starting the Server
+```bash
+python server.py
+```
+This will:
+- Start a FastAPI server on port 8000
+- Create a web interface accessible at http://localhost:8000
+- Create a "recordings" directory if it doesn't exist
+
+### Running the Client
+```bash
+python client.py [options]
+```
+
+#### Client Options
+- `--server URL`: Server URL (default: http://localhost:8000)
+- `--duration SECONDS`: Maximum recording duration (default: 60 seconds)
+- `--no-save-local`: Disable client-side audio recording
+- `--sample-rate RATE`: Audio sample rate (default: 16000 Hz)
+
+#### Example Commands
+```bash
+# Connect to local server with default settings
+python client.py
+
+# Connect to remote server with longer recording time
+python client.py --server http://example.com:8000 --duration 120
+
+# Use higher sample rate and don't save locally
+python client.py --sample-rate 44100 --no-save-local
+```
+
+### Usage Flow
+1. Start the server first
+2. Run the client with desired options
+3. Press Enter in the client terminal to start streaming
+4. Audio will be captured from your microphone and sent to the server
+5. The client will automatically stop after the specified duration
+6. Or press Ctrl+C to stop earlier
+7. Recordings are saved in the "recordings" directory on both client and server
+
+### Recordings Format
+- All recordings are saved as WAV files
+- The server creates two recordings:
+  - A MediaRecorder version (recordings/audio_*.wav)
+  - A higher-quality version from raw frames (recordings/main_*.wav)
+- The client saves a local recording if not disabled (recordings/client_audio_*.wav) 
