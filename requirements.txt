@@ -8,7 +8,7 @@ pyaudio==0.2.14
 
 # WebSocket requirements for AudioCodes protocol
 websockets==12.0
-requests==2.31.0
+requests==2.32.2
 
 # For the AudioCodes bridge client
 python-dateutil==2.8.2 
