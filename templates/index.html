@@ -14,11 +14,40 @@
                 const stopButton = document.getElementById('stopButton');
                 
                 let pc;
+                let clientId;
                 
                 startButton.addEventListener('click', async () => {
                     startButton.disabled = true;
                     
-                    pc = new RTCPeerConnection();
+                    // Create peer connection with STUN servers
+                    pc = new RTCPeerConnection({
+                        iceServers: [
+                            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
+                        ]
+                    });
+                    
+                    // Set up ICE candidate handling
+                    pc.onicecandidate = async (event) => {
+                        if (event.candidate && clientId) {
+                            console.log('Sending ICE candidate to server');
+                            try {
+                                await fetch('/ice-candidate', {
+                                    method: 'POST',
+                                    headers: {
+                                        'Content-Type': 'application/json'
+                                    },
+                                    body: JSON.stringify({
+                                        candidate: event.candidate.candidate,
+                                        sdpMid: event.candidate.sdpMid,
+                                        sdpMLineIndex: event.candidate.sdpMLineIndex,
+                                        clientId: clientId
+                                    })
+                                });
+                            } catch (e) {
+                                console.error('Error sending ICE candidate:', e);
+                            }
+                        }
+                    };
                     
                     try {
                         const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
@@ -26,6 +55,13 @@
                         
                         pc.oniceconnectionstatechange = () => {
                             console.log('ICE connection state:', pc.iceConnectionState);
+                        };
+                        
+                        pc.onconnectionstatechange = () => {
+                            console.log('Connection state:', pc.connectionState);
+                            if (pc.connectionState === 'connected') {
+                                console.log('Successfully connected to server');
+                            }
                         };
                         
                         const offer = await pc.createOffer();
@@ -43,7 +79,12 @@
                         });
                         
                         const answer = await response.json();
-                        await pc.setRemoteDescription(answer);
+                        clientId = answer.clientId;  // Store client ID for ICE candidates
+                        
+                        await pc.setRemoteDescription({
+                            type: answer.type,
+                            sdp: answer.sdp
+                        });
                         
                         stopButton.disabled = false;
                     } catch (e) {
