@@ -2,9 +2,9 @@
 fastapi==0.107.0
 uvicorn==0.25.0
 aiortc==1.5.0
-numpy==1.26.2
-av==11.0.0
-pyaudio==0.2.14
+numpy==1.24.3
+av==10.0.0
+pyaudio==0.2.13
 
 # WebSocket requirements for AudioCodes protocol
 websockets==12.0
