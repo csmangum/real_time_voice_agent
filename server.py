@@ -1,925 +1,351 @@
 import asyncio
+import socket
+import json
+import threading
 import os
-import time
-import uuid
 import wave
-from contextlib import asynccontextmanager
-from typing import Dict, List, Optional
-
-import av
+import time
 import numpy as np
-import uvicorn
-from aiortc import (
-    MediaStreamTrack,
-    RTCIceCandidate,
-    RTCPeerConnection,
-    RTCSessionDescription,
-)
-from aiortc.contrib.media import MediaRecorder
-from aiortc.mediastreams import MediaStreamError
-from fastapi import FastAPI, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from aiortc import RTCPeerConnection, RTCSessionDescription, MediaStreamTrack
+from aiortc.contrib.media import MediaRecorder, MediaBlackhole, MediaRelay
+from av import AudioFrame
 
+SIGNALING_PORT = 9999
+RECORD_SECONDS = 10  # Match client recording time
+DEFAULT_RECORDING_PATH = os.path.abspath("server_received.wav")  # Default path
+TEMP_PATH = os.path.abspath("temp_recording.wav")  # Temporary file
+DIRECT_RECORD_PATH = os.path.abspath("direct_recording.wav")  # Direct recording path
 
-# Define lifespan context manager
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Startup: nothing specific needed here
-    yield
-    # Shutdown: close all connections
-    print("Application shutting down - cleaning up connections")
-    # Close all peer connections and stop all recorders
-    tasks = [cleanup(client_id) for client_id in list(pcs.keys())]
-    await asyncio.gather(*tasks)
-    print("All recorders stopped and connections closed")
+class DirectAudioRecorder(MediaStreamTrack):
+    """Media track that directly records audio to a file."""
 
-    # Check if any recordings were created
-    if os.path.exists("recordings"):
-        files = os.listdir("recordings")
-        print(f"Recording directory contains {len(files)} files: {files}")
-
-
-# Create FastAPI app with lifespan
-app = FastAPI(lifespan=lifespan)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Store active peer connections and recorders
-pcs: Dict[str, RTCPeerConnection] = {}
-recorders: Dict[str, MediaRecorder] = {}
-audio_frames: Dict[str, List[bytes]] = {}
-audio_formats: Dict[str, Dict] = {}  # Store format info for each client
-client_cleanup_lock: Dict[str, bool] = {}  # Track if cleanup is in progress
-client_last_activity: Dict[str, float] = {}  # Track when we last received data
-client_start_times: Dict[str, float] = {}  # Track when each client started recording
-client_session_info: Dict[str, Dict] = {}  # Additional session information
-
-# Constants for audio processing
-MAX_BACKFILL_GAP = 3  # Reduced from 10 to 3 - Maximum number of frames to backfill for small gaps
-FRAME_INTERPOLATION = False  # Disabled frame interpolation to reduce processing overhead
-
-
-# Audio processing class
-class AudioTrackProcessor(MediaStreamTrack):
     kind = "audio"
 
-    def __init__(self, track, client_id):
+    def __init__(self, track, path):
         super().__init__()
         self.track = track
-        self.client_id = client_id
+        self.path = path
+        self.sample_rate = 48000
+        self.channels = 1
+        self.sample_width = 2  # 16-bit audio
+        self.frames = []
         self.frame_count = 0
+        self.start_time = time.time()
+        self.file = None
+        self.wf = None
         
-        # Initially use client-provided format but always verify with actual frame data
-        if client_id in audio_formats:
-            format_info = audio_formats[client_id]
-            self.sample_rate = format_info.get("sample_rate")
-            self.channels = format_info.get("channels", 1)
-            self.sample_width = format_info.get("sample_width", 2)
-            # We consider format as NOT detected - we'll verify from actual frames
-            self.format_detected = False
-            print(f"Starting with client-provided format for {client_id}: {format_info} (will verify)")
-        else:
-            # Otherwise start with no format until detected
-            self.sample_rate = None
-            self.channels = 1
-            self.sample_width = 2
-            self.format_detected = False
-
-        # Add frame loss tracking
-        self.missed_frames = 0
-        self.total_expected_frames = 0
-        self.last_pts = None
-        self.first_pts = None
-        self.last_timestamp = time.time()
-
-        # Create a buffer for potentially missed frames
-        self.last_valid_frame = None
-        self.max_buffer_size = 20  # Number of recent frames to keep
-
-        print(f"Created AudioTrackProcessor for client {client_id}")
-
-    # Update format detection to be more robust
-    def _detect_and_update_format(self, frame):
-        format_changed = False
-        initial_detection = not self.format_detected
+        # Open the file for direct writing
+        try:
+            self.wf = wave.open(self.path, 'wb')
+            self.wf.setnchannels(self.channels)
+            self.wf.setsampwidth(self.sample_width)
+            self.wf.setframerate(self.sample_rate)
+            print(f"Opened direct recording file: {self.path}")
+        except Exception as e:
+            print(f"Error opening direct recording file: {e}")
+            self.wf = None
         
-        # Try to detect sample rate from frame - this is crucial for correct playback speed
-        if hasattr(frame, "rate") and frame.rate is not None:
-            if self.sample_rate != frame.rate:
-                print(f"Detected sample rate: {frame.rate}Hz for client {self.client_id} (was: {self.sample_rate}Hz)")
-                self.sample_rate = frame.rate
-                format_changed = True
-        
-        # Detect channel layout
-        if hasattr(frame, "layout"):
-            layout_str = str(frame.layout)
-            channels = 2 if "stereo" in layout_str else 1
-            if self.channels != channels:
-                print(f"Detected {channels} channels for client {self.client_id} (was: {self.channels})")
-                self.channels = channels
-                format_changed = True
-
-        # Detect sample format and width
-        if hasattr(frame, "format"):
-            # Map PyAV format to byte width
-            format_to_width = {
-                "s16": 2,  # 16-bit
-                "s32": 4,  # 32-bit
-                "flt": 4,  # float
-                "dbl": 8,  # double
-                "u8": 1,  # 8-bit unsigned
-                "s8": 1,  # 8-bit signed
-            }
-            
-            if frame.format in format_to_width:
-                new_width = format_to_width[frame.format]
-                if self.sample_width != new_width:
-                    print(f"Detected {frame.format} format ({new_width} bytes) for client {self.client_id} (was: {self.sample_width})")
-                    self.sample_width = new_width
-                    format_changed = True
-        
-        # If we detected any format change or this is initial detection, always update audio_formats
-        if (format_changed or initial_detection) and self.sample_rate is not None:
-            # Update the actual detected format
-            detected_format = {
-                "sample_rate": self.sample_rate,
-                "channels": self.channels,
-                "sample_width": self.sample_width,
-                "format": getattr(frame, "format", "unknown"),
-                "detected": True,  # Mark this as a detected format
-            }
-            
-            # Save client-provided values for reference
-            if self.client_id in audio_formats and audio_formats[self.client_id].get("client_provided", False):
-                detected_format["original_client_rate"] = audio_formats[self.client_id].get("sample_rate")
-                detected_format["original_client_channels"] = audio_formats[self.client_id].get("channels")
-                detected_format["client_provided"] = True
-            
-            # Retain file path if it was already set
-            if self.client_id in audio_formats and "file_path" in audio_formats[self.client_id]:
-                detected_format["file_path"] = audio_formats[self.client_id]["file_path"]
-            
-            # Update the global format info
-            audio_formats[self.client_id] = detected_format
-            
-            # Format was successfully detected
-            self.format_detected = True
-            
-            # Log the update
-            if format_changed:
-                print(f"Updated audio format for client {self.client_id}: {detected_format}")
-                if initial_detection:
-                    print(f"Initial format detection complete")
-                else:
-                    print(f"Format change detected at frame {self.frame_count}")
-            return True
-            
-        return False
-
     async def recv(self):
+        # Get the frame from the track we're wrapping
         try:
             frame = await self.track.recv()
-            current_time = time.time()
-            time_since_last = current_time - self.last_timestamp
-            self.last_timestamp = current_time
             self.frame_count += 1
-
-            # Record the first PTS for timing information
-            if self.first_pts is None and hasattr(frame, "pts"):
-                self.first_pts = frame.pts
-                if self.client_id in client_session_info:
-                    client_session_info[self.client_id]["first_pts"] = self.first_pts
-                    client_session_info[self.client_id]["first_frame_time"] = current_time
-                    # Calculate initial latency
-                    initial_latency = (current_time - client_session_info[self.client_id].get("connection_timestamp", current_time)) * 1000
-                    print(f"First audio frame latency: {initial_latency:.2f}ms for client {self.client_id}")
-
-            # Track frame timestamps for minimal gap detection
-            if self.last_pts is not None and hasattr(frame, "pts"):
-                # Simplified gap detection with less overhead
-                expected_pts_diff = frame.samples
-                actual_pts_diff = frame.pts - self.last_pts
-
-                # Only detect significant gaps to reduce overhead
-                if actual_pts_diff > expected_pts_diff * 2:
-                    self.missed_frames += int((actual_pts_diff - expected_pts_diff) / expected_pts_diff)
-                    # Only log major gap issues
-                    if self.frame_count % 100 == 0 or actual_pts_diff > expected_pts_diff * 5:
-                        print(f"Detected significant gap between PTS {self.last_pts} and {frame.pts}")
-
-            if hasattr(frame, "pts"):
-                self.last_pts = frame.pts
-            self.total_expected_frames += 1
-
-            # Update client activity timestamp
-            client_last_activity[self.client_id] = time.time()
-
-            # Always check the format for the first 10 frames to ensure accurate detection
-            if self.frame_count <= 10:
-                self._detect_and_update_format(frame)
-            # Then check occasionally for any changes (WebRTC can change format mid-stream)
-            elif self.frame_count % 100 == 0:
-                self._detect_and_update_format(frame)
-
-            # Optimize audio extraction for faster handling
-            if self.client_id in audio_frames:
-                # Fast path direct plane access
-                try:
-                    if hasattr(frame, "planes") and len(frame.planes) > 0:
-                        pcm_bytes = bytes(frame.planes[0])
-                    else:
-                        pcm_bytes = self._extract_audio_data(frame)
-                        
-                    if pcm_bytes:
-                        # Add to main recording buffer
-                        audio_frames[self.client_id].append(pcm_bytes)
-                        self.last_valid_frame = frame
-                        
-                        # Reduced logging frequency
-                        if self.frame_count % 500 == 0:
-                            total_kb = sum(len(b) for b in audio_frames[self.client_id]) / 1024
-                            audio_sec = len(audio_frames[self.client_id]) * len(pcm_bytes) / (self.sample_width * self.channels * self.sample_rate or 48000)
-                            print(f"Processed {self.frame_count} frames ({total_kb:.1f} KB, {audio_sec:.1f} sec) for client {self.client_id}")
-                except Exception as e:
-                    if self.frame_count % 500 == 0:  # Reduced error logging
-                        print(f"Frame processing error: {str(e)}")
-
-            return frame
-
-        except MediaStreamError:
-            print(f"MediaStreamError: Track ended for client {self.client_id}")
-            raise
-        except asyncio.CancelledError:
-            print(f"Track processing cancelled for client {self.client_id}")
-            raise
-        except Exception as e:
-            print(f"Error in recv for client {self.client_id}: {str(e)}")
-            raise
-
-    def _extract_audio_data(self, frame) -> Optional[bytes]:
-        """Extract audio data from frame using the most reliable method available"""
-        try:
-            # Method 1: Use PyAV's to_ndarray if available (most accurate)
-            if hasattr(frame, "to_ndarray"):
-                try:
-                    array = frame.to_ndarray()
-                    return array.tobytes()
-                except Exception as e:
-                    print(f"to_ndarray failed: {e}")
-
-            # Method 2: Access plane data directly
-            if hasattr(frame, "planes") and len(frame.planes) > 0:
-                try:
-                    return bytes(frame.planes[0])
-                except Exception as e:
-                    print(f"Plane extraction failed: {e}")
-
-            # Method 3: For backwards compatibility
-            if hasattr(frame, "to_bytes"):
-                try:
-                    return frame.to_bytes()
-                except Exception as e:
-                    print(f"to_bytes failed: {e}")
-
-            # Method 4: Direct buffer access for specific frame types
-            if hasattr(frame, "buffer") and frame.buffer:
-                try:
-                    return bytes(frame.buffer)
-                except Exception as e:
-                    print(f"Buffer extraction failed: {e}")
-
-            # Method 5: Create a placeholder silent frame if everything else fails
-            if hasattr(frame, "samples") and hasattr(frame, "format"):
-                try:
-                    # Create silence with the same properties as the frame
-                    bytes_per_sample = 2  # Default for s16
-                    if frame.format == "s32" or frame.format == "flt":
-                        bytes_per_sample = 4
-                    elif frame.format == "dbl":
-                        bytes_per_sample = 8
-
-                    channels = 1
-                    if hasattr(frame, "layout") and "stereo" in str(frame.layout):
-                        channels = 2
-
-                    # Create silent frame with correct size
-                    silence = b"\x00" * (frame.samples * channels * bytes_per_sample)
-                    print(f"Created placeholder silent frame ({len(silence)} bytes)")
-                    return silence
-                except Exception as e:
-                    print(f"Silence creation failed: {e}")
-
-            return None
-        except Exception as e:
-            print(f"Audio extraction error: {e}")
-            return None
-
-
-class OfferModel(BaseModel):
-    sdp: str
-    type: str
-    audio_format: dict = None  # Optional dict for audio format parameters
-
-
-class IceCandidateModel(BaseModel):
-    candidate: str
-    sdpMLineIndex: int
-    sdpMid: str
-    clientId: str
-
-
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    with open("templates/index.html", "r") as f:
-        return f.read()
-
-
-@app.post("/offer")
-async def offer(params: OfferModel):
-    offer = RTCSessionDescription(sdp=params.sdp, type=params.type)
-
-    pc = RTCPeerConnection()
-    client_id = str(uuid.uuid4())
-    pcs[client_id] = pc
-    client_cleanup_lock[client_id] = False  # Initialize cleanup lock
-    client_last_activity[client_id] = time.time()  # Set initial activity time
-    client_start_times[client_id] = time.time()  # Record when this client started
-
-    # Log connection start with timestamp for latency tracking
-    start_timestamp = time.time()
-    print(f"Connection request received at {start_timestamp:.6f} for client {client_id}")
-
-    # Initialize session info
-    client_session_info[client_id] = {
-        "start_time": time.time(),
-        "first_frame_time": None,
-        "first_pts": None,
-        "sdp_offer": params.sdp,  # Store original SDP for debugging
-        "connection_timestamp": start_timestamp,
-    }
-
-    # Prepare audio file path
-    os.makedirs("recordings", exist_ok=True)
-    timestamp = time.strftime("%Y%m%d-%H%M%S")
-    audio_file = f"recordings/audio_{timestamp}_{client_id[-8:]}.wav"
-
-    # Initialize frame storage and format info
-    audio_frames[client_id] = []
-    
-    # Use client-provided format if available, otherwise use defaults
-    if params.audio_format:
-        audio_formats[client_id] = params.audio_format
-        audio_formats[client_id]["client_provided"] = True  # Mark as explicitly provided
-        print(f"Using client-provided audio format: {params.audio_format}")
-    else:
-        audio_formats[client_id] = {
-            "sample_rate": 48000,
-            "channels": 1,
-            "sample_width": 2,
-            "format": "s16",
-            "client_provided": False  # Mark as default
-        }
-        print(f"Client didn't provide format, using defaults: {audio_formats[client_id]}")
-
-    # Store the audio file path for later use in cleanup
-    audio_formats[client_id]["file_path"] = audio_file
-
-    # Create recorder - but we'll use the raw data for the primary recording now
-    recorder = MediaRecorder(audio_file)
-    recorders[client_id] = recorder
-
-    @pc.on("track")
-    def on_track(track):
-        track_receive_time = time.time()
-        print(f"Track received: {track.kind} from client {client_id} at {track_receive_time:.6f}")
-        print(f"Track latency: {(track_receive_time - start_timestamp)*1000:.2f}ms")
-        
-        if track.kind == "audio":
-            local_track = AudioTrackProcessor(track, client_id)
             
-            # Add track with high priority for latency optimization
-            pc.addTrack(local_track)
-            recorder.addTrack(local_track)
-            print(f"Added audio track to recorder for client {client_id} with high priority")
-
-        @track.on("ended")
-        async def on_ended():
-            print(f"Track ended for client {client_id}")
-            # Explicitly save audio on track end
-            try:
-                # Add a longer delay to allow all pending frames to be processed
-                print(f"Waiting for additional audio frames to arrive (3 seconds)...")
-                await asyncio.sleep(3.0)
-
-                if client_id in pcs:  # Only cleanup if client still exists
-                    # Check if we have enough audio frames to save
-                    if client_id in audio_frames and len(audio_frames[client_id]) > 0:
-                        frames_count = len(audio_frames[client_id])
-                        print(
-                            f"Track ended with {frames_count} audio frames available for saving"
-                        )
-                        await cleanup(client_id)
-                    else:
-                        print(
-                            f"Track ended but no audio frames available for client {client_id}"
-                        )
-                        await cleanup(client_id)
-            except Exception as e:
-                import traceback
-
-                print(f"Error in track.ended handler: {e}")
-                print(f"Error type: {type(e).__name__}")
-                print(f"Traceback: {traceback.format_exc()}")
-
-    @pc.on("icecandidate")
-    def on_icecandidate(candidate):
-        print(
-            f"ICE candidate generated for client {client_id}: {candidate and candidate.sdpMid}"
-        )
-        # In a full solution, these would be sent to the client
-        # This is handled by the WebRTC internals for now
-
-    @pc.on("connectionstatechange")
-    async def on_connectionstatechange():
-        state = pc.connectionState
-        print(f"Connection state for {client_id}: {state}")
-
-        if state == "connected":
-            print(f"Client {client_id} successfully connected")
-        elif state in ["failed", "closed"]:
-            print(f"Client {client_id} connection {state}, cleaning up")
-            # Add delay before cleanup to ensure all frames are processed
-            print(f"Waiting for final audio frames to be processed (3 seconds)...")
-            await asyncio.sleep(3.0)
-            if client_id in pcs:  # Only cleanup if client still exists
-                await cleanup(client_id)
-        elif state == "disconnected":
-            print(f"Client {client_id} temporarily disconnected")
-            # Start a task to check if it reconnects within a timeout
-            asyncio.create_task(check_reconnect(client_id, timeout=10))
-
-    # Set the remote description
-    await pc.setRemoteDescription(offer)
-    await recorder.start()
-    print(f"Recorder started for client {client_id}, writing to {audio_file}")
-
-    # Create answer
-    answer = await pc.createAnswer()
-    await pc.setLocalDescription(answer)
-
-    # Start inactivity checker task
-    asyncio.create_task(check_client_activity(client_id))
-
-    return {
-        "sdp": pc.localDescription.sdp,
-        "type": pc.localDescription.type,
-        "clientId": client_id,
-    }
-
-
-@app.post("/ice-candidate")
-async def handle_ice_candidate(params: IceCandidateModel):
-    client_id = params.clientId
-
-    if client_id not in pcs:
-        return {"status": "error", "message": "Client not found"}
-
-    pc = pcs[client_id]
-
-    # Create and add ICE candidate
-    candidate = RTCIceCandidate(
-        component=None,
-        foundation=None,
-        ip=None,
-        port=None,
-        priority=None,
-        protocol=None,
-        type=None,
-        sdpMid=params.sdpMid,
-        sdpMLineIndex=params.sdpMLineIndex,
-        candidate=params.candidate,
-    )
-
-    await pc.addIceCandidate(candidate)
-    print(f"Added ICE candidate for client {client_id}")
-
-    return {"status": "success"}
-
-
-async def check_reconnect(client_id, timeout):
-    """Wait for a client to reconnect before cleaning up"""
-    try:
-        if client_id not in pcs:
-            return
-
-        # Wait for the timeout period
-        for _ in range(timeout):
-            await asyncio.sleep(1)
-            # Check if client has reconnected
-            if client_id in pcs and pcs[client_id].connectionState == "connected":
-                print(f"Client {client_id} successfully reconnected")
-                return
-            # Check if client is already cleaned up
-            if client_id not in pcs:
-                print(f"Client {client_id} already cleaned up during reconnection wait")
-                return
-
-        # After timeout, check if client is still disconnected
-        if client_id in pcs and pcs[client_id].connectionState in [
-            "disconnected",
-            "failed",
-        ]:
-            print(
-                f"Client {client_id} failed to reconnect after {timeout}s, cleaning up"
+            # Process audio frames
+            if isinstance(frame, AudioFrame) and len(frame.planes) > 0:
+                # Extract audio data
+                audio_data = bytes(frame.planes[0])
+                self.frames.append(audio_data)
+                
+                # Print diagnostic info for first several frames
+                if self.frame_count <= 10:
+                    audio_array = np.frombuffer(audio_data, dtype=np.int16)
+                    max_amplitude = np.max(np.abs(audio_array))
+                    rms = np.sqrt(np.mean(np.square(audio_array)))
+                    print(f"Received frame {self.frame_count}: {len(audio_data)} bytes, max amp={max_amplitude}, RMS={rms:.2f}")
+                elif self.frame_count == 11:
+                    print("Continuing to receive frames...")
+                elif self.frame_count % 50 == 0:
+                    print(f"Received {self.frame_count} frames")
+                
+                # Write directly to the file if available
+                if self.wf:
+                    try:
+                        self.wf.writeframes(audio_data)
+                    except Exception as e:
+                        print(f"Error writing to direct recording: {e}")
+            else:
+                print(f"Received non-audio frame or empty planes: {type(frame)}")
+                
+            return frame
+            
+        except Exception as e:
+            print(f"Error in DirectAudioRecorder.recv(): {e}")
+            # Create a silent frame as fallback
+            silent_frame = AudioFrame(
+                format="s16",
+                layout="mono",
+                samples=1024,
             )
-            await cleanup(client_id)
-    except Exception as e:
-        import traceback
-
-        print(f"Error in reconnect checker for {client_id}: {e}")
-        print(f"Error type: {type(e).__name__}")
-        print(f"Traceback: {traceback.format_exc()}")
-
-
-async def check_client_activity(client_id, max_inactivity=30):
-    """Monitor client for inactivity and clean up if necessary"""
-    try:
-        while client_id in pcs and client_id in client_last_activity:
-            # Calculate inactivity time
-            inactivity_time = time.time() - client_last_activity[client_id]
-
-            # If client has been inactive too long, clean up
-            if inactivity_time > max_inactivity:
-                print(
-                    f"Client {client_id} inactive for {inactivity_time:.1f}s, closing connection"
-                )
-                await cleanup(client_id)
-                break
-
-            # Check every 5 seconds
-            await asyncio.sleep(5)
-    except Exception as e:
-        print(f"Error in activity checker for {client_id}: {e}")
-
-
-async def cleanup(client_id):
-    # Prevent duplicate cleanups
-    if client_id not in pcs or client_cleanup_lock.get(client_id, False):
-        return
-
-    # Mark this client as being cleaned up
-    client_cleanup_lock[client_id] = True
-    print(f"Starting cleanup for client {client_id}")
-
-    try:
-        pc = pcs[client_id]
-
-        # Stop recorder if exists
-        if client_id in recorders:
-            recorder = recorders[client_id]
-            audio_file = audio_formats.get(client_id, {}).get("file_path", None)
-            print(f"Stopping recorder for client {client_id}")
-
+            silent_frame.pts = int((time.time() - self.start_time) * self.sample_rate)
+            silent_frame.sample_rate = self.sample_rate
+            silent_frame.time_base = f"1/{self.sample_rate}"
+            
+            # Fill with silence
+            silence = np.zeros(1024, dtype=np.int16)
+            silent_frame.planes[0].update(silence.tobytes())
+            return silent_frame
+        
+    def stop(self):
+        """Stop recording and close the file."""
+        print(f"Stopping DirectAudioRecorder after {self.frame_count} frames")
+        if self.wf:
             try:
-                await asyncio.wait_for(recorder.stop(), timeout=3.0)
+                self.wf.close()
+                print(f"Closed direct recording file")
+                if os.path.exists(self.path):
+                    size = os.path.getsize(self.path)
+                    print(f"Direct recording file size: {size} bytes")
+            except Exception as e:
+                print(f"Error closing direct recording file: {e}")
+        
+        # Also save to a backup file using the collected frames
+        if self.frames:
+            try:
+                backup_path = self.path + ".backup.wav"
+                with wave.open(backup_path, 'wb') as wf:
+                    wf.setnchannels(self.channels)
+                    wf.setsampwidth(self.sample_width)
+                    wf.setframerate(self.sample_rate)
+                    wf.writeframes(b''.join(self.frames))
+                print(f"Saved {len(self.frames)} frames to backup file: {backup_path}")
+            except Exception as e:
+                print(f"Error saving backup file: {e}")
+        else:
+            print("No frames collected for backup file")
+
+async def run_server():
+    # Initialize variables
+    server_socket = None
+    conn = None
+    pc = None
+    recorder = None
+    direct_recorder = None
+    tasks = set()
+    track_received = False
+    
+    # Determine where to save the recording
+    recording_path = DEFAULT_RECORDING_PATH
+    
+    try:
+        # Try to create a test file to check write permissions
+        try:
+            with open("test_write.txt", "w") as f:
+                f.write("test")
+            os.remove("test_write.txt")
+            print("Write permission test: OK")
+        except Exception as e:
+            print(f"WARNING: Write permission test failed: {e}")
+            print("Will try to save in user's home directory instead")
+            recording_path = os.path.join(os.path.expanduser("~"), "server_received.wav")
+            print(f"New recording path: {recording_path}")
+        
+        server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        server_socket.bind(('localhost', SIGNALING_PORT))
+        server_socket.listen(1)
+        print(f"Server listening on port {SIGNALING_PORT}")
+        print(f"Will save recording to: {recording_path}")
+        print(f"Will save direct recording to: {DIRECT_RECORD_PATH}")
+
+        conn, addr = server_socket.accept()
+        print(f"Connection from {addr}")
+
+        # Create a relay for audio tracks to prevent any "track ended" issues
+        relay = MediaRelay()
+        
+        # Create peer connection
+        pc = RTCPeerConnection()
+        
+        # Create recorder with the determined path
+        recorder = MediaRecorder(recording_path)
+        recording_done = threading.Event()
+        
+        # Monitor connection state
+        connection_established = asyncio.Event()
+        
+        @pc.on("connectionstatechange")
+        async def on_connectionstatechange():
+            print(f"Connection state: {pc.connectionState}")
+            if pc.connectionState == "connected":
+                connection_established.set()
+                print("ICE connection established - should be receiving audio now")
+            elif pc.connectionState in ["failed", "closed", "disconnected"]:
+                print(f"Connection is in {pc.connectionState} state")
+                if not recording_done.is_set():
+                    recording_done.set()
+
+        @pc.on("track")
+        async def on_track(track):
+            nonlocal track_received, direct_recorder
+            track_received = True
+            print(f"Receiving {track.kind} track of type {type(track).__name__}")
+            
+            if track.kind == "audio":
+                # Use a relay to ensure the track stays alive
+                relayed_track = relay.subscribe(track)
+                
+                # Create our direct recorder
+                direct_recorder = DirectAudioRecorder(relayed_track, DIRECT_RECORD_PATH)
+                
+                # Also add track to aiortc recorder
+                recorder.addTrack(relayed_track)
+                
+                # Start recorder
+                try:
+                    await recorder.start()
+                    print(f"Started recording incoming audio to {recording_path}")
+                except Exception as e:
+                    print(f"Failed to start recorder: {e}")
+                
+                # Start a separate task to actively pull frames from the track
+                async def pull_frames():
+                    print("Started frame pulling task")
+                    frame_count = 0
+                    try:
+                        while not recording_done.is_set():
+                            try:
+                                frame = await direct_recorder.recv()
+                                frame_count += 1
+                                if frame_count % 100 == 0:
+                                    print(f"Pulled {frame_count} frames")
+                            except Exception as e:
+                                print(f"Error pulling frame: {e}")
+                                await asyncio.sleep(0.1)
+                    except asyncio.CancelledError:
+                        print("Frame pulling task cancelled")
+                    except Exception as e:
+                        print(f"Frame pulling task error: {e}")
+                    finally:
+                        print(f"Frame pulling task ended after {frame_count} frames")
+                
+                pull_task = asyncio.create_task(pull_frames())
+                tasks.add(pull_task)
+            
+            # Schedule recording stop after RECORD_SECONDS
+            async def stop_recording_after_timeout():
+                await asyncio.sleep(RECORD_SECONDS)
+                if not recording_done.is_set():
+                    print(f"Recording time limit reached ({RECORD_SECONDS}s)")
+                    recording_done.set()
+            
+            timeout_task = asyncio.create_task(stop_recording_after_timeout())
+            tasks.add(timeout_task)
+
+        # Receive SDP offer
+        offer_data = json.loads(conn.recv(65536).decode())
+        offer = RTCSessionDescription(sdp=offer_data["sdp"], type=offer_data["type"])
+        
+        # Print incoming SDP for debugging
+        print("Received SDP offer - checking audio configuration:")
+        # Look for audio codec information in the SDP
+        sdp_lines = offer.sdp.splitlines()
+        for line in sdp_lines:
+            if "opus" in line.lower() or "audio" in line.lower() or "m=audio" in line:
+                print(f"SDP audio config: {line}")
+        
+        await pc.setRemoteDescription(offer)
+
+        # Send SDP answer
+        answer = await pc.createAnswer()
+        await pc.setLocalDescription(answer)
+        
+        # Print our SDP answer for debugging
+        print("Sending SDP answer with audio configuration:")
+        for line in pc.localDescription.sdp.splitlines():
+            if "opus" in line.lower() or "audio" in line.lower() or "m=audio" in line:
+                print(f"SDP answer: {line}")
+                
+        response = json.dumps({
+            "sdp": pc.localDescription.sdp,
+            "type": pc.localDescription.type
+        }).encode()
+        conn.sendall(response)
+
+        # Wait for recording to complete or timeout
+        try:
+            # Check every 100ms if recording has finished
+            for i in range(int((RECORD_SECONDS + 3) * 10)):  # Wait max RECORD_SECONDS + 3 seconds
+                if recording_done.is_set():
+                    print("Recording completed")
+                    break
+                if i % 20 == 0:  # Every 2 seconds
+                    print(f"Still waiting for recording to complete: {i/10:.1f}s elapsed")
+                await asyncio.sleep(0.1)
+        except Exception as e:
+            print(f"Exception while waiting for recording: {e}")
+
+    except Exception as e:
+        print(f"Server error: {e}")
+    finally:
+        # Cleanup resources in reverse order of creation
+        print("Stopping recording and cleaning up...")
+        
+        # Cancel any pending tasks
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+                
+        # Wait a moment for tasks to clean up
+        await asyncio.sleep(0.5)
+        
+        # Stop direct recorder if available
+        if direct_recorder:
+            direct_recorder.stop()
+        
+        # Properly close recorder and PC with error handling
+        if recorder:
+            try:
+                print("Stopping recorder...")
+                await recorder.stop()
                 print(f"Recorder stopped successfully")
-            except asyncio.TimeoutError:
-                print(f"Timeout stopping recorder - continuing with cleanup")
-            except MediaStreamError:
-                print(
-                    f"MediaStreamError during recorder stop - this is normal when the track ends"
-                )
             except Exception as e:
                 print(f"Error stopping recorder: {e}")
-
-            # Remove the recorder from our tracking dict
-            if client_id in recorders:
-                del recorders[client_id]
-
-            # Create our own high-quality recording from raw frames
-            if client_id in audio_frames and audio_frames[client_id]:
-                try:
-                    # Check if we have start time info to compare with client
-                    start_time = client_start_times.get(client_id)
-                    duration = time.time() - start_time if start_time else None
-
-                    # Generate new timestamp for the better quality recording
-                    timestamp = time.strftime("%Y%m%d-%H%M%S")
-                    main_path = f"recordings/main_{timestamp}_{client_id[-8:]}.wav"
-                    frames = audio_frames[client_id]
-
-                    # Ensure format info is set with correct values
-                    if client_id in audio_formats:
-                        format_info = audio_formats[client_id]
-                    else:
-                        format_info = {"sample_rate": 48000, "channels": 1, "sample_width": 2}
-                    
-                    # Get format parameters from detected values
-                    sample_rate = format_info.get("sample_rate", 48000)
-                    if sample_rate is None or sample_rate <= 0:
-                        print(f"Warning: Invalid sample rate detected: {sample_rate}, using 16000Hz")
-                        sample_rate = 16000
-                        
-                    channels = format_info.get("channels", 1)
-                    if channels <= 0:
-                        channels = 1
-                        
-                    bytes_per_sample = format_info.get("sample_width", 2)
-                    if bytes_per_sample <= 0:
-                        bytes_per_sample = 2
-                    
-                    # Log where format came from
-                    format_source = "detected from frames"
-                    if format_info.get("detected", False):
-                        format_source = "detected from actual audio frames"
-                    elif format_info.get("client_provided", False):
-                        format_source = "explicitly provided by client but overridden"
-                    
-                    print(f"Creating WAV with format: {sample_rate}Hz, {channels} channels, {bytes_per_sample} bytes per sample")
-                    print(f"Format was {format_source}")
-                    
-                    # If we have both client-provided and detected formats that differ, show the difference
-                    if format_info.get("client_provided", False) and format_info.get("detected", False):
-                        original_rate = format_info.get("original_client_rate")
-                        if original_rate and original_rate != sample_rate:
-                            print(f"WebRTC changed sample rate: client sent {original_rate}Hz but WebRTC delivered {sample_rate}Hz")
-                        
-                        original_channels = format_info.get("original_client_channels")
-                        if original_channels and original_channels != channels:
-                            print(f"WebRTC changed channels: client sent {original_channels} but WebRTC delivered {channels}")
-                    
-                    # Calculate frame size (bytes)
-                    frame_size = len(frames[0]) if frames else 0
-                    
-                    # Calculate samples per frame
-                    samples_per_frame = (
-                        frame_size / (bytes_per_sample * channels) if frame_size and bytes_per_sample and channels else 0
-                    )
-
-                    # Expected duration based on audio data
-                    frame_count = len(frames)
-                    audio_duration = (frame_count * samples_per_frame) / sample_rate if sample_rate > 0 else 0
-                    
-                    # Get the actual session duration for comparison
-                    if client_id in client_start_times:
-                        actual_duration = time.time() - client_start_times[client_id]
-                        print(f"Session actual duration: {actual_duration:.1f}s vs calculated audio duration: {audio_duration:.1f}s")
-                        
-                        # Check for significant timing mismatch (more than 20% difference)
-                        if actual_duration > 0 and abs(actual_duration - audio_duration) / actual_duration > 0.2:
-                            print(f"WARNING: Significant timing mismatch detected! Received audio is {audio_duration/actual_duration*100:.1f}% of real-time duration")
-                            
-                            # Check if this is likely due to WebRTC resampling
-                            webrtc_resampled = False
-                            if format_info.get("client_provided", False) and format_info.get("detected", False):
-                                original_rate = format_info.get("original_client_rate")
-                                if original_rate and original_rate != sample_rate:
-                                    ratio = sample_rate / original_rate
-                                    expected_ratio = actual_duration / audio_duration
-                                    # If the ratios are close, it's likely just WebRTC resampling
-                                    if abs(ratio - expected_ratio) / expected_ratio < 0.1:
-                                        print(f"Timing mismatch explained by WebRTC resampling: {original_rate}Hz → {sample_rate}Hz")
-                                        webrtc_resampled = True
-                            
-                            if not webrtc_resampled:
-                                print(f"This may indicate timing or buffering issues between client and server")
-                                
-                                # Calculate correction factor for sample rate
-                                if audio_duration > 0 and actual_duration > 0:
-                                    correction_factor = actual_duration / audio_duration
-                                    # Only apply correction if it's significant but not extreme
-                                    if 0.5 < correction_factor < 5.0:
-                                        corrected_sample_rate = int(sample_rate * correction_factor)
-                                        print(f"Applying sample rate correction: {sample_rate}Hz -> {corrected_sample_rate}Hz (factor: {correction_factor:.2f})")
-                                        sample_rate = corrected_sample_rate
-                                    else:
-                                        print(f"Correction factor too extreme ({correction_factor:.2f}), not applying. Check client/server sync.")
-
-                    print(
-                        f"Audio stats: {frame_count} frames, {samples_per_frame} samples/frame"
-                    )
-                    print(
-                        f"Session duration: {duration:.1f}s, audio duration: {audio_duration:.1f}s"
-                    )
-                    
-                    # Normalize frame lengths - ensure all frames have the same size
-                    # This fixes potential audio corruption if frame sizes vary
-                    if frames:
-                        # Find the most common frame size
-                        frame_sizes = [len(f) for f in frames]
-                        most_common_size = max(set(frame_sizes), key=frame_sizes.count)
-
-                        # Normalize frames to the most common size
-                        normalized_frames = []
-                        for frame in frames:
-                            if len(frame) == most_common_size:
-                                normalized_frames.append(frame)
-                            elif len(frame) < most_common_size:
-                                # Pad shorter frames with silence
-                                padding = b"\x00" * (most_common_size - len(frame))
-                                normalized_frames.append(frame + padding)
-                            else:
-                                # Truncate longer frames
-                                normalized_frames.append(frame[:most_common_size])
-
-                        print(
-                            f"Normalized {len(frames)} frames to consistent size of {most_common_size} bytes"
-                        )
-                        frames = normalized_frames
-
-                    # Write raw audio to wav file with detected format
-                    with wave.open(main_path, "wb") as wf:
-                        wf.setnchannels(channels)
-                        wf.setsampwidth(bytes_per_sample)
-                        wf.setframerate(sample_rate)  # This is crucial for correct playback speed
-                        wf.writeframes(b"".join(frames))
-
-                    file_size = os.path.getsize(main_path)
-                    print(
-                        f"Primary audio saved to {main_path} ({file_size/1024:.1f} KB), {audio_duration:.1f}s at {sample_rate}Hz"
-                    )
-
-                except Exception as e:
-                    import traceback
-
-                    print(f"Error saving primary audio: {e}")
-                    print(f"Error type: {type(e).__name__}")
-                    print(f"Traceback: {traceback.format_exc()}")
-                    
-            else:
-                print(f"No frames to save for client {client_id}")
-
-            # Clean up audio frames and format info
-            if client_id in audio_frames:
-                del audio_frames[client_id]
-            if client_id in audio_formats:
-                del audio_formats[client_id]
-            if client_id in client_last_activity:
-                del client_last_activity[client_id]
-            if client_id in client_start_times:
-                del client_start_times[client_id]
-            if client_id in client_session_info:
-                del client_session_info[client_id]
-
-        # Close peer connection
-        await pc.close()
-
-        # Delete the peer connection from dictionaries
-        if client_id in pcs:
-            del pcs[client_id]
-
-        if client_id in client_cleanup_lock:
-            del client_cleanup_lock[client_id]
-
-        print(f"Cleanup completed for client {client_id}")
-
-    except Exception as e:
-        import traceback
-
-        print(f"Error during cleanup for {client_id}: {e}")
-        print(f"Error type: {type(e).__name__}")
-        print(f"Traceback: {traceback.format_exc()}")
-
+        
+        if pc:
+            try:
+                await pc.close()
+            except Exception as e:
+                print(f"Error closing WebRTC connection: {e}")
+        
+        # Close socket connections
+        if conn:
+            conn.close()
+        
+        if server_socket:
+            server_socket.close()
+        
+        # Verify files exist
+        for path in [recording_path, DIRECT_RECORD_PATH, DIRECT_RECORD_PATH + ".backup.wav"]:
+            if path and os.path.exists(path):
+                file_size = os.path.getsize(path)
+                print(f"Saved recording to {path} ({file_size} bytes)")
+                if file_size == 0:
+                    print(f"WARNING: File exists but is empty: {path}")
+            elif path:
+                print(f"WARNING: Recording file not found at {path}")
+        
+        if track_received:
+            print(f"Track was received - check the logs for details")
+        else:
+            print("No audio track was received from client")
 
 if __name__ == "__main__":
-    # Create templates directory if it doesn't exist
-    os.makedirs("templates", exist_ok=True)
-
-    # Create a simple HTML file for testing
-    with open("templates/index.html", "w") as f:
-        f.write(
-            """
-        <!DOCTYPE html>
-        <html>
-        <head>
-            <title>WebRTC Audio Streaming</title>
-        </head>
-        <body>
-            <h1>WebRTC Audio Streaming</h1>
-            <button id="startButton">Start Streaming</button>
-            <button id="stopButton" disabled>Stop Streaming</button>
-            
-            <script>
-                const startButton = document.getElementById('startButton');
-                const stopButton = document.getElementById('stopButton');
-                
-                let pc;
-                let clientId;
-                
-                startButton.addEventListener('click', async () => {
-                    startButton.disabled = true;
-                    
-                    // Create peer connection with STUN servers
-                    pc = new RTCPeerConnection({
-                        iceServers: [
-                            { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] }
-                        ]
-                    });
-                    
-                    // Set up ICE candidate handling
-                    pc.onicecandidate = async (event) => {
-                        if (event.candidate && clientId) {
-                            console.log('Sending ICE candidate to server');
-                            try {
-                                await fetch('/ice-candidate', {
-                                    method: 'POST',
-                                    headers: {
-                                        'Content-Type': 'application/json'
-                                    },
-                                    body: JSON.stringify({
-                                        candidate: event.candidate.candidate,
-                                        sdpMid: event.candidate.sdpMid,
-                                        sdpMLineIndex: event.candidate.sdpMLineIndex,
-                                        clientId: clientId
-                                    })
-                                });
-                            } catch (e) {
-                                console.error('Error sending ICE candidate:', e);
-                            }
-                        }
-                    };
-                    
-                    try {
-                        const stream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
-                        stream.getTracks().forEach(track => pc.addTrack(track, stream));
-                        
-                        pc.oniceconnectionstatechange = () => {
-                            console.log('ICE connection state:', pc.iceConnectionState);
-                        };
-                        
-                        pc.onconnectionstatechange = () => {
-                            console.log('Connection state:', pc.connectionState);
-                            if (pc.connectionState === 'connected') {
-                                console.log('Successfully connected to server');
-                            }
-                        };
-                        
-                        const offer = await pc.createOffer();
-                        await pc.setLocalDescription(offer);
-                        
-                        const response = await fetch('/offer', {
-                            method: 'POST',
-                            headers: {
-                                'Content-Type': 'application/json'
-                            },
-                            body: JSON.stringify({
-                                sdp: pc.localDescription.sdp,
-                                type: pc.localDescription.type
-                            })
-                        });
-                        
-                        const answer = await response.json();
-                        clientId = answer.clientId;  // Store client ID for ICE candidates
-                        
-                        await pc.setRemoteDescription({
-                            type: answer.type,
-                            sdp: answer.sdp
-                        });
-                        
-                        stopButton.disabled = false;
-                    } catch (e) {
-                        console.error('Error:', e);
-                        startButton.disabled = false;
-                    }
-                });
-                
-                stopButton.addEventListener('click', async () => {
-                    if (pc) {
-                        console.log('Gracefully stopping connection...');
-                        stopButton.disabled = true;
-                        stopButton.textContent = 'Stopping...';
-                        
-                        // Add a short delay to ensure all audio gets transmitted
-                        await new Promise(resolve => {
-                            setTimeout(() => {
-                                console.log('Graceful shutdown delay complete');
-                                resolve();
-                            }, 3000);
-                        });
-                        
-                        // Now close the connection
-                        pc.close();
-                        pc = null;
-                        console.log('Connection closed');
-                    }
-                    
-                    startButton.disabled = false;
-                    stopButton.disabled = true;
-                    stopButton.textContent = 'Stop Streaming';
-                });
-            </script>
-        </body>
-        </html>
-        """
-        )
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    try:
+        asyncio.run(run_server())
+    except KeyboardInterrupt:
+        print("Server terminated by user")
+    except Exception as e:
+        print(f"Error: {e}")
+    finally:
+        print("Exiting server")

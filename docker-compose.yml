@@ -1,0 +1,37 @@
+version: '3.8'
+
+services:
+  audio-server:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./recordings:/app/recordings:rw
+      - ./logs:/app/logs:rw
+      - ./templates:/app/templates:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - OPENAI_API_BASE=${OPENAI_API_BASE}
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.5'
+          memory: 512M
+    restart: unless-stopped
+    networks:
+      - audio-network
+
+networks:
+  audio-network:
+    driver: bridge 
