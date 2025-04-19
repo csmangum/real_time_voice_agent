@@ -1,19 +1,48 @@
 import asyncio
 import logging
+import os
+import time
 import traceback
 import uuid
 import wave
 from typing import Dict, List
+from datetime import datetime
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaPlayer, MediaRelay
+from aiortc.contrib.media import MediaPlayer, MediaRecorder, MediaRelay
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 # Set up logging
-logging.basicConfig(level=logging.DEBUG)  # Set to DEBUG for more detailed logs
+# Ensure logs directory exists
+os.makedirs("logs", exist_ok=True)
+
+# Create a unique log filename with timestamp
+log_filename = f"logs/server_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+
+# Set up logging to both console and file
 logger = logging.getLogger("WebRTC-Server")
+logger.setLevel(logging.DEBUG)  # Set to DEBUG for more detailed logs
+
+# Create console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.DEBUG)
+
+# Create file handler
+file_handler = logging.FileHandler(log_filename)
+file_handler.setLevel(logging.DEBUG)
+
+# Create formatter and add it to the handlers
+formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+console_handler.setFormatter(formatter)
+file_handler.setFormatter(formatter)
+
+# Add handlers to logger
+logger.addHandler(console_handler)
+logger.addHandler(file_handler)
+
+logger.info(f"Logging to file: {log_filename}")
 
 app = FastAPI()
 
@@ -36,6 +65,11 @@ relay = MediaRelay()
 peer_connections: Dict[str, RTCPeerConnection] = {}
 # Store active tasks
 tasks: List[asyncio.Task] = []
+# Store audio recorders
+audio_recorders: Dict[str, MediaRecorder] = {}
+
+# Ensure recordings directory exists
+os.makedirs("server_recordings", exist_ok=True)
 
 
 @app.post("/offer")
@@ -50,19 +84,75 @@ async def offer(request: Request):
         pc = RTCPeerConnection()
         peer_connections[pc_id] = pc
 
+        # Create recording filename
+        timestamp = int(time.time())
+        recording_filename = f"server_recordings/client_audio_{pc_id}_{timestamp}.wav"
+        recorder = MediaRecorder(recording_filename)
+        audio_recorders[pc_id] = recorder
+
         # Track ICE candidates
         @pc.on("icecandidate")
         def on_icecandidate(candidate):
             logger.info(f"Generated ICE candidate: {candidate}")
 
+        # Handle tracks received from client
+        @pc.on("track")
+        async def on_track(track):
+            logger.info(f"Received {track.kind} track from client")
+
+            if track.kind == "audio":
+                logger.info(f"Recording client audio to {recording_filename}")
+                recorder.addTrack(track)
+                await recorder.start()
+
+                @track.on("ended")
+                async def on_ended():
+                    logger.info(f"Client audio track ended, stopping recorder")
+                    await recorder.stop()
+
         # Handle cleanup when client disconnects
         @pc.on("connectionstatechange")
         async def on_connectionstatechange():
             logger.info(f"Connection state changed to: {pc.connectionState}")
-            if pc.connectionState == "failed" or pc.connectionState == "closed":
-                logger.info(f"Removing connection {pc_id} from active connections")
+            if (
+                pc.connectionState == "failed"
+                or pc.connectionState == "closed"
+                or pc.connectionState == "disconnected"
+            ):
+                logger.info(
+                    f"Connection {pc_id} is {pc.connectionState}, cleaning up resources"
+                )
+
+                # Stop the recorder if it's still running
+                if pc_id in audio_recorders:
+                    try:
+                        recorder = audio_recorders[pc_id]
+                        logger.info(
+                            f"Stopping recording client audio to {recording_filename}"
+                        )
+                        await recorder.stop()
+                        logger.info(
+                            f"Successfully stopped recording to {recording_filename}"
+                        )
+                        del audio_recorders[pc_id]
+                    except Exception as e:
+                        logger.error(f"Error stopping recorder: {e}")
+                        logger.error(traceback.format_exc())
+
+                # Remove peer connection from active connections
                 if pc_id in peer_connections:
-                    del peer_connections[pc_id]
+                    try:
+                        # Close the peer connection if not already closed
+                        if pc.connectionState != "closed":
+                            await pc.close()
+                        del peer_connections[pc_id]
+                        logger.info(f"Successfully removed connection {pc_id}")
+                    except Exception as e:
+                        logger.error(f"Error closing peer connection: {e}")
+                        logger.error(traceback.format_exc())
+                        # Still try to remove from dictionary even if close fails
+                        if pc_id in peer_connections:
+                            del peer_connections[pc_id]
 
         # Set up audio stream from sample.wav
         try:
