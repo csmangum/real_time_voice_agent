@@ -1,301 +1,302 @@
 import asyncio
-import socket
-import json
-import pyaudio
-import wave
-import threading
-import time
-from aiortc import RTCPeerConnection, RTCSessionDescription
-from aiortc.contrib.media import MediaStreamTrack
-from av import AudioFrame
+import logging
+import queue
+import traceback
+
+import aiohttp
 import numpy as np
-import os
+import pyaudio
+from aiortc import RTCPeerConnection, RTCSessionDescription
+from aiortc.mediastreams import MediaStreamError
 
-SIGNALING_PORT = 9999
-CHUNK = 1024
-FORMAT = pyaudio.paInt16
-CHANNELS = 1
-RATE = 48000  # Standard rate for WebRTC
-RECORD_SECONDS = 10  # Set recording time to 10 seconds
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("WebRTC-Test-Client")
 
-class PyAudioStreamTrack(MediaStreamTrack):
-    kind = "audio"
-    
-    def __init__(self):
-        super().__init__()
-        self.p = pyaudio.PyAudio()
-        # List available input devices
-        print("Available audio input devices:")
-        for i in range(self.p.get_device_count()):
-            dev_info = self.p.get_device_info_by_index(i)
-            print(f"Device {i}: {dev_info['name']} (inputs: {dev_info['maxInputChannels']})")
-        
-        # Open stream
-        self.stream = self.p.open(
-            format=FORMAT,
-            channels=CHANNELS,
-            rate=RATE,
-            input=True,
-            frames_per_buffer=CHUNK
+
+class AudioStreamPlayer:
+    """Class to play received audio in real-time."""
+
+    def __init__(self, track, buffer_size=4096):  # Larger buffer for stability
+        self.track = track
+        self.buffer_size = buffer_size
+        # Jitter buffer implementation as a queue
+        self.audio_queue = queue.Queue(
+            maxsize=100
+        )  # Larger queue to handle network jitter
+        self.running = False
+        self.sample_rate = 48000  # WebRTC default
+        self.pyaudio_instance = pyaudio.PyAudio()
+        self.stream = None
+        self.prebuffer_count = 10  # Wait for this many frames before starting playback
+        self.prebuffer_done = False
+
+    def audio_callback(self, in_data, frame_count, time_info, status):
+        """PyAudio callback to fetch and play audio data"""
+        # If pre-buffering is not complete, return silence
+        if not self.prebuffer_done:
+            return (b"\x00" * frame_count * 2, pyaudio.paContinue)
+
+        try:
+            # Try to get data from the queue
+            data = self.audio_queue.get_nowait()
+            # Check if data size matches expected size (2 bytes per sample)
+            expected_size = frame_count * 2
+            if len(data) < expected_size:
+                # Pad with zeros if too short
+                data = data + b"\x00" * (expected_size - len(data))
+            elif len(data) > expected_size:
+                # Truncate if too long
+                data = data[:expected_size]
+            return (data, pyaudio.paContinue)
+        except queue.Empty:
+            # If queue is empty, return silence
+            return (b"\x00" * frame_count * 2, pyaudio.paContinue)
+
+    async def start(self):
+        """Start playing audio from the track."""
+        self.running = True
+
+        # Start PyAudio stream
+        self.stream = self.pyaudio_instance.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=self.sample_rate,
+            output=True,
+            frames_per_buffer=self.buffer_size,
+            stream_callback=self.audio_callback,
         )
-        print(f"Opened audio input stream: format={FORMAT}, channels={CHANNELS}, rate={RATE}")
-        
-        self.sample_count = 0
-        self.recording = False
-        self.frames = []
-        self.frame_count = 0
-        self.recording_finished = threading.Event()
-        self._start_recording()
-        
-    def _start_recording(self):
-        self.recording = True
-        self.record_thread = threading.Thread(target=self._record_audio, daemon=True)
-        self.record_thread.start()
-        
-    def _record_audio(self):
-        start_time = time.time()
-        while self.recording and (time.time() - start_time) < RECORD_SECONDS:
-            try:
-                data = self.stream.read(CHUNK, exception_on_overflow=False)
-                
-                # Quick audio level check for first few chunks
-                if len(self.frames) < 5:
-                    audio_array = np.frombuffer(data, dtype=np.int16)
-                    max_amplitude = np.max(np.abs(audio_array))
-                    rms = np.sqrt(np.mean(np.square(audio_array)))
-                    print(f"Audio chunk {len(self.frames)}: max={max_amplitude}, RMS={rms:.2f}")
-                
-                self.frames.append(data)
-            except Exception as e:
-                print(f"Error reading audio: {e}")
-                break
-        
-        # Signal that recording is complete without calling stop()
-        print(f"Finished recording ({RECORD_SECONDS} seconds)")
-        self.recording_finished.set()
-            
-    async def recv(self):
-        # Make sure we always return a valid frame, even if no data is available yet
-        if not self.frames and not self.recording_finished.is_set():
-            print("No frames yet, waiting...")
-            await asyncio.sleep(0.1)
-            # Return silence frame
-            silence = np.zeros(CHUNK, dtype=np.int16)
-            frame = AudioFrame(format="s16", layout="mono", samples=CHUNK)
-            frame.pts = self.sample_count
-            frame.sample_rate = RATE
-            frame.time_base = "1/48000"
-            self.sample_count += CHUNK
-            frame.planes[0].update(silence.tobytes())
-            return frame
-            
-        if self.frames:
-            self.frame_count += 1
-            frame_data = self.frames.pop(0)
-            
-            # Ensure frame data is the right size and format
-            if len(frame_data) != CHUNK * 2:  # 2 bytes per sample for int16
-                print(f"Warning: Unexpected frame size: {len(frame_data)} bytes")
-                # Pad or truncate to expected size
-                if len(frame_data) < CHUNK * 2:
-                    frame_data = frame_data + bytes(CHUNK * 2 - len(frame_data))
-                else:
-                    frame_data = frame_data[:CHUNK * 2]
-            
-            # Create the frame
-            frame = AudioFrame(
-                format="s16",
-                layout="mono",
-                samples=CHUNK,
-            )
-            frame.pts = self.sample_count
-            frame.sample_rate = RATE
-            frame.time_base = "1/48000"
-            self.sample_count += CHUNK
-            
-            # Convert bytes to numpy array
-            frame_array = np.frombuffer(frame_data, dtype=np.int16)
-            
-            # Increase amplitude if needed - multiply by 10 to ensure it's audible
-            # Only do this if the original max amplitude is very low
-            max_amplitude = np.max(np.abs(frame_array))
-            if max_amplitude < 100:  # If very quiet
-                print(f"Amplifying quiet audio: max amplitude before={max_amplitude}")
-                frame_array = np.clip(frame_array * 100, -32768, 32767).astype(np.int16)
-                max_amplitude = np.max(np.abs(frame_array))
-                print(f"After amplification: max amplitude={max_amplitude}")
-            
-            # Populate the plane with audio data
-            frame.planes[0].update(frame_array.tobytes())
-            
-            # Print diagnostic info
-            if self.frame_count <= 5:
-                print(f"Sending frame {self.frame_count}: {len(frame_data)} bytes, max amplitude: {max_amplitude}")
-            elif self.frame_count == 6:
-                print("Continuing to send frames...")
-            elif self.frame_count % 50 == 0:
-                print(f"Sent {self.frame_count} frames")
-                
-            return frame
-        
-        # If we're done recording and no more frames, return None to end the track
-        if self.recording_finished.is_set():
-            print("No more frames to send, ending audio track")
-            return None
-            
-        # Fallback - should never reach here
-        print("Warning: Unexpected state in recv()")
-        return None
-        
-    def stop(self):
-        print("Stopping audio track...")
-        self.recording = False
-        
-        # Wait for the recording thread to finish if it's still running
-        # Only join from external threads, not from the recording thread itself
-        if (hasattr(self, 'record_thread') and 
-            self.record_thread.is_alive() and 
-            threading.current_thread() != self.record_thread):
-            self.record_thread.join(timeout=2)
-            
-        if self.stream:
-            self.stream.stop_stream()
-            self.stream.close()
-        if self.p:
-            self.p.terminate()
-            
-        # Save the recorded audio to a file
-        if self.frames:
-            try:
-                output_path = os.path.abspath("client_sent.wav")
-                wf = wave.open(output_path, 'wb')
-                wf.setnchannels(CHANNELS)
-                wf.setsampwidth(self.p.get_sample_size(FORMAT))
-                wf.setframerate(RATE)
-                wf.writeframes(b''.join(self.frames))
-                wf.close()
-                print(f"Saved recording to {output_path}")
-            except Exception as e:
-                print(f"Error saving recording: {e}")
-        else:
-            print("No frames left to save")
 
-async def run_client():
-    # Track all tasks to ensure proper cleanup
-    tasks = set()
-    client_socket = None
-    pc = None
-    audio_track = None
-    
+        # Start the stream, but it won't play yet due to prebuffering
+        self.stream.start_stream()
+        logger.info("Started audio stream (prebuffering...)")
+
+        # Start the worker to receive frames
+        self.worker_task = asyncio.create_task(self._receive_frames())
+
+    async def _receive_frames(self):
+        """Worker to receive frames from the track and add them to the queue."""
+        prebuffer_frames = 0
+
+        try:
+            while self.running:
+                try:
+                    frame = await self.track.recv()
+
+                    # Get audio data and ensure it's in the correct format
+                    audio_data = frame.to_ndarray()
+
+                    # Simple conversion to int16 with safety checks
+                    try:
+                        # Ensure the range is within [-1.0, 1.0] before scaling
+                        max_val = max(abs(np.max(audio_data)), abs(np.min(audio_data)))
+                        if max_val > 1.0:
+                            audio_data = (
+                                audio_data / max_val
+                            )  # Normalize if outside range
+
+                        # Convert to int16
+                        pcm_data = (audio_data * 32767).astype(np.int16).tobytes()
+                    except Exception as e:
+                        logger.error(f"Error converting audio data: {e}")
+                        continue  # Skip this frame if conversion fails
+
+                    # Prebuffering stage
+                    if not self.prebuffer_done:
+                        self.audio_queue.put(
+                            pcm_data
+                        )  # Use blocking put during prebuffer
+                        prebuffer_frames += 1
+
+                        if prebuffer_frames >= self.prebuffer_count:
+                            self.prebuffer_done = True
+                            logger.info(
+                                f"Prebuffering complete ({prebuffer_frames} frames). Starting playback."
+                            )
+                    else:
+                        # Regular operation - try to maintain a consistent buffer level
+                        current_buffer_level = self.audio_queue.qsize()
+
+                        # If buffer is getting too full, remove some frames to prevent buildup
+                        if current_buffer_level > 0.9 * self.audio_queue.maxsize:
+                            # Remove older frames to make room
+                            frames_to_drop = int(
+                                current_buffer_level * 0.2
+                            )  # Drop 20% of frames
+                            for _ in range(frames_to_drop):
+                                try:
+                                    self.audio_queue.get_nowait()
+                                except queue.Empty:
+                                    break
+
+                        # Add the current frame
+                        try:
+                            self.audio_queue.put_nowait(pcm_data)
+                        except queue.Full:
+                            # If still full, drop oldest frame
+                            self.audio_queue.get_nowait()
+                            self.audio_queue.put_nowait(pcm_data)
+
+                except MediaStreamError:
+                    logger.warning("Media stream error, stopping playback")
+                    break
+        except Exception as e:
+            logger.error(f"Error in receive_frames: {e}")
+            logger.error(traceback.format_exc())
+        finally:
+            logger.info("Stopping frame receiver")
+
+    async def stop(self):
+        """Stop playing audio."""
+        if self.running:
+            self.running = False
+
+            # Cancel the worker task
+            if hasattr(self, "worker_task"):
+                self.worker_task.cancel()
+                try:
+                    await self.worker_task
+                except asyncio.CancelledError:
+                    pass
+
+            # Stop and close the PyAudio stream
+            if self.stream:
+                self.stream.stop_stream()
+                self.stream.close()
+                self.stream = None
+
+            # Terminate PyAudio
+            if self.pyaudio_instance:
+                self.pyaudio_instance.terminate()
+                self.pyaudio_instance = None
+
+            logger.info("Stopped audio playback")
+
+
+async def run_test_client(server_url="http://localhost:8000"):
+    # Create peer connection
+    pc = RTCPeerConnection()
+
+    # Audio player
+    audio_player = None
+
+    # Signal for graceful shutdown
+    stop_event = asyncio.Event()
+
+    # Log ice candidates for debugging
+    @pc.on("icecandidate")
+    def on_icecandidate(candidate):
+        logger.info(f"Generated ICE candidate: {candidate}")
+
+    # Create a data channel
+    logger.info("Creating data channel 'test-client-data'")
+    dc = pc.createDataChannel("test-client-data")
+
+    # Add an audio transceiver to receive audio from the server
+    logger.info("Adding audio transceiver to receive audio from server")
+    pc.addTransceiver("audio", direction="recvonly")
+
+    @dc.on("open")
+    def on_open():
+        logger.info("✓ Data channel opened")
+        # Send a test message to the server
+        dc.send("Hello from test client!")
+        logger.info("Sent test message to server")
+
+    @dc.on("message")
+    def on_message(message):
+        logger.info(f"Received data: {message}")
+
+    @dc.on("close")
+    def on_close():
+        logger.info("Data channel closed")
+
+    # Track connection state for debugging
+    @pc.on("connectionstatechange")
+    async def on_connectionstatechange():
+        logger.info(f"Connection state changed to: {pc.connectionState}")
+        if pc.connectionState == "failed" or pc.connectionState == "closed":
+            logger.error(f"Connection state is {pc.connectionState}!")
+            stop_event.set()
+
+    # Handle audio tracks
+    @pc.on("track")
+    async def on_track(track):
+        logger.info(f"Received track of kind: {track.kind}")
+        if track.kind == "audio":
+            nonlocal audio_player
+            logger.info("Creating audio player for received track")
+            audio_player = AudioStreamPlayer(track)
+            await audio_player.start()
+
+            @track.on("ended")
+            async def on_ended():
+                logger.info("Audio track ended")
+                if audio_player:
+                    await audio_player.stop()
+                stop_event.set()
+
+    # Create an offer
+    logger.info("Creating offer...")
+    await pc.setLocalDescription(await pc.createOffer())
+    logger.info("Local description set")
+
+    # Send offer to server
     try:
-        # Configure WebRTC with proper constraints
-        pc = RTCPeerConnection()
-        print("Starting client...")
+        logger.info(f"Sending offer to {server_url}/offer")
+        async with aiohttp.ClientSession() as session:
+            async with session.post(
+                f"{server_url}/offer",
+                json={"sdp": pc.localDescription.sdp, "type": pc.localDescription.type},
+            ) as response:
+                if response.status == 200:
+                    answer_data = await response.json()
+                    logger.info("Received answer from server")
+                else:
+                    error_text = await response.text()
+                    logger.error(
+                        f"Server returned error {response.status}: {error_text}"
+                    )
+                    await pc.close()
+                    return
+    except Exception as e:
+        logger.error(f"Error communicating with server: {e}")
+        await pc.close()
+        return
 
-        # Create PyAudio track
-        audio_track = PyAudioStreamTrack()
-        sender = pc.addTrack(audio_track)
-        
-        # Create and send offer with audio enabled
-        offer = await pc.createOffer()
-        await pc.setLocalDescription(offer)
-        
-        # Check SDP for audio settings
-        print("SDP Offer created with the following audio settings:")
-        for line in pc.localDescription.sdp.splitlines():
-            if "opus" in line.lower() or "audio" in line.lower() or "m=audio" in line:
-                print(f"SDP: {line}")
-
-        client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        client_socket.connect(('localhost', SIGNALING_PORT))
-        client_socket.sendall(json.dumps({
-            "sdp": pc.localDescription.sdp,
-            "type": pc.localDescription.type
-        }).encode())
-        print("Sent SDP offer to server")
-
-        # Receive and apply answer
-        answer_data = json.loads(client_socket.recv(65536).decode())
+    # Set remote description
+    try:
+        logger.info("Setting remote description with answer from server")
         answer = RTCSessionDescription(sdp=answer_data["sdp"], type=answer_data["type"])
         await pc.setRemoteDescription(answer)
-        print("Received SDP answer from server")
-        
-        # Create a task for the connection establishment
-        connection_established = asyncio.Event()
-        
-        @pc.on("connectionstatechange")
-        async def on_connectionstatechange():
-            print(f"Connection state: {pc.connectionState}")
-            if pc.connectionState == "connected":
-                connection_established.set()
-                print("ICE connection established - audio should now be flowing")
-            elif pc.connectionState == "failed":
-                print("ICE connection failed - check network and firewall settings")
-        
-        # Wait for either connection establishment or timeout
-        try:
-            # Wait for connection (with timeout) before proceeding
-            connection_wait_task = asyncio.create_task(
-                asyncio.wait_for(connection_established.wait(), timeout=5)
-            )
-            tasks.add(connection_wait_task)
-            await connection_wait_task
-            print("WebRTC connection established")
-        except asyncio.TimeoutError:
-            print("Connection establishment timed out, continuing anyway")
-        except Exception as e:
-            print(f"Connection error: {e}")
-
-        # Keep streaming audio for the recording duration
-        try:
-            for _ in range(int(RECORD_SECONDS * 2)):  # Check twice per second
-                if audio_track.recording_finished.is_set():
-                    print("Recording completed naturally")
-                    # Keep the connection open a bit longer to ensure all data is sent
-                    await asyncio.sleep(2)
-                    break
-                await asyncio.sleep(0.5)
-        except Exception as e:
-            print(f"Exception while waiting for recording: {e}")
-        
+        logger.info("Remote description set successfully")
     except Exception as e:
-        print(f"Client error: {e}")
+        logger.error(f"Error setting remote description: {e}")
+        await pc.close()
+        return
+
+    # Keep connection open until stop event is set or timeout
+    try:
+        logger.info("Connection established, waiting for audio stream...")
+        print("Listening for audio... Press Ctrl+C to stop.")
+
+        # Wait for the stop event or timeout after 60 seconds
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=60)
+        except asyncio.TimeoutError:
+            logger.info("Reached timeout, closing connection")
+
+    except KeyboardInterrupt:
+        logger.info("Keyboard interrupt received")
     finally:
-        # Cleanup resources in reverse order of creation
-        print("Cleaning up resources...")
-        
-        # Cancel any pending tasks
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-                
-        # Stop audio track
-        if audio_track:
-            audio_track.stop()
-            
-        # Close WebRTC connection 
-        if pc:
-            # Create a task for graceful closure
-            close_task = asyncio.create_task(pc.close())
-            try:
-                await asyncio.wait_for(close_task, timeout=2)
-            except asyncio.TimeoutError:
-                print("WebRTC connection closure timed out")
-            except Exception as e:
-                print(f"Error during WebRTC connection closure: {e}")
-                
-        # Close socket
-        if client_socket:
-            client_socket.close()
-            
-        print("Client finished.")
+        # Clean up
+        if audio_player:
+            await audio_player.stop()
+
+        logger.info("Closing connection")
+        await pc.close()
+        logger.info("Connection closed")
+
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(run_client())
-    except KeyboardInterrupt:
-        print("Client terminated by user")
-    except Exception as e:
-        print(f"Error: {e}")
-    finally:
-        print("Exiting client")
+    asyncio.run(run_test_client())
