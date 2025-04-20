@@ -2,32 +2,32 @@ FROM python:3.9-slim
 
 WORKDIR /app
 
-# Install system dependencies for aiortc and PortAudio
+# Install system dependencies required for aiortc
 RUN apt-get update && apt-get install -y \
-    build-essential \
     libavdevice-dev \
     libavfilter-dev \
     libopus-dev \
     libvpx-dev \
     pkg-config \
-    libsrtp2-dev \
-    portaudio19-dev \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python dependencies
-COPY requirements.txt .
+# Install Python dependencies
+COPY requirements.txt requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy server code
-COPY audio_server.py .
+# Create directories for logs and recordings
+RUN mkdir -p logs server_recordings static
 
-# Create directories
-RUN mkdir -p recordings
-RUN mkdir -p logs
+# Copy server code and static files
+COPY server.py .
+COPY static/ static/
 
-# Expose port for the server
+# Expose the port the app runs on
 EXPOSE 8000
 
-# Command to run the server
-CMD ["python", "audio_server.py"] 
+# Define volumes for logs and recordings
+VOLUME ["/app/logs", "/app/server_recordings"]
+
+# Command to run the application
+CMD ["python", "server.py"] 
