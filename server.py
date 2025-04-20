@@ -5,8 +5,8 @@ import time
 import traceback
 import uuid
 import wave
-from typing import Dict, List
 from datetime import datetime
+from typing import Dict, List
 
 from aiortc import RTCPeerConnection, RTCSessionDescription
 from aiortc.contrib.media import MediaPlayer, MediaRecorder, MediaRelay
@@ -34,7 +34,7 @@ file_handler = logging.FileHandler(log_filename)
 file_handler.setLevel(logging.DEBUG)
 
 # Create formatter and add it to the handlers
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 console_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 
@@ -63,8 +63,7 @@ relay = MediaRelay()
 
 # Store active peer connections
 peer_connections: Dict[str, RTCPeerConnection] = {}
-# Store active tasks
-tasks: List[asyncio.Task] = []
+
 # Store audio recorders
 audio_recorders: Dict[str, MediaRecorder] = {}
 

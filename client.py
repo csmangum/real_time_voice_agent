@@ -1,10 +1,10 @@
 import asyncio
 import fractions  # Add this import for Fraction
 import logging
-import queue
-import traceback
 import os
+import queue
 import time
+import traceback
 import wave
 from datetime import datetime
 
@@ -30,11 +30,11 @@ console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 
 # Create file handler
-file_handler = logging.FileHandler(log_filename, encoding='utf-8')
+file_handler = logging.FileHandler(log_filename, encoding="utf-8")
 file_handler.setLevel(logging.INFO)
 
 # Create formatter and add it to the handlers
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 console_handler.setFormatter(formatter)
 file_handler.setFormatter(formatter)
 
@@ -47,6 +47,7 @@ logger.info(f"Logging to file: {log_filename}")
 # Ensure recordings directory exists
 os.makedirs("client_recordings", exist_ok=True)
 
+
 class AudioStreamPlayer:
     """Class to play received audio in real-time and optionally record it."""
 
@@ -54,19 +55,19 @@ class AudioStreamPlayer:
         self.track = track
         self.buffer_size = buffer_size
         # Jitter buffer implementation as a queue
-        self.audio_queue = queue.Queue(
-            maxsize=20
-        )  # Smaller queue to reduce latency
+        self.audio_queue = queue.Queue(maxsize=20)  # Smaller queue to reduce latency
         self.running = False
         self.sample_rate = 48000  # WebRTC default
         self.pyaudio_instance = pyaudio.PyAudio()
         self.stream = None
         self.prebuffer_count = 3  # Fewer frames to reduce initial delay
         self.prebuffer_done = False
-        
+
         # Recording variables
         self.should_record = True
-        self.recording_filename = f"client_recordings/server_audio_{int(time.time())}.wav"
+        self.recording_filename = (
+            f"client_recordings/server_audio_{int(time.time())}.wav"
+        )
         self.wav_file = None
         self.all_audio_data = bytearray()
 
@@ -109,7 +110,7 @@ class AudioStreamPlayer:
         # Start the stream, but it won't play yet due to prebuffering
         self.stream.start_stream()
         logger.info("Started audio stream (prebuffering...)")
-        
+
         # Initialize WAV file for recording if recording is enabled
         if self.should_record:
             try:
@@ -141,22 +142,22 @@ class AudioStreamPlayer:
                     try:
                         # Check if audio data is already in reasonable range
                         max_val = np.max(np.abs(audio_data))
-                        
+
                         # Normalize only if needed (if max amplitude is too low or too high)
                         if max_val > 1.0 or max_val < 0.1:
                             # Normalize to appropriate range for good volume
                             audio_data = audio_data / max_val * 0.8
-                            
+
                         # Apply a small gain boost if volume is too low
                         if max_val < 0.3:
                             audio_data = audio_data * 1.5
-                            
+
                         # Consider adding a simple limiter to avoid clipping
                         audio_data = np.clip(audio_data, -0.95, 0.95)
-                        
+
                         # Convert to int16 with proper scaling
                         pcm_data = (audio_data * 32767).astype(np.int16).tobytes()
-                        
+
                         # Save the audio data if recording is enabled
                         if self.should_record and self.wav_file:
                             self.all_audio_data.extend(pcm_data)
@@ -232,7 +233,7 @@ class AudioStreamPlayer:
             if self.pyaudio_instance:
                 self.pyaudio_instance.terminate()
                 self.pyaudio_instance = None
-                
+
             # Finalize recording if enabled
             if self.should_record and self.wav_file:
                 try:
