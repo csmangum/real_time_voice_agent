@@ -419,7 +419,7 @@ class MicrophoneStreamTrack(AudioStreamTrack):
         return pts, time_base
 
 
-async def run_test_client(server_url="http://localhost:8000"):
+async def run_test_client(server_url="http://host.docker.internal:8000"):
     # Create peer connection
     pc = RTCPeerConnection()
 
