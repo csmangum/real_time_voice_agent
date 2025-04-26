@@ -6,6 +6,13 @@ from fastapi import WebSocket
 
 from app.websocket_manager import WebSocketManager
 from app.models.conversation import ConversationManager
+from app.models.message_schemas import (
+    ConnectionValidateMessage,
+    SessionInitiateMessage,
+    SessionEndMessage,
+    ConnectionValidatedResponse,
+    SessionAcceptedResponse
+)
 
 @pytest.fixture
 def websocket_manager():
@@ -15,10 +22,23 @@ def websocket_manager():
 def websocket():
     websocket = AsyncMock(spec=WebSocket)
     # Mock the receive_text method to return different messages on consecutive calls
+    # We're still returning JSON strings as that's what WebSockets receive
     websocket.receive_text.side_effect = [
-        json.dumps({"type": "connection.validate"}),
-        json.dumps({"type": "session.initiate", "conversationId": "test-id", "supportedMediaFormats": ["raw/lpcm16"]}),
-        json.dumps({"type": "session.end", "conversationId": "test-id"})
+        ConnectionValidateMessage(type="connection.validate").json(),
+        SessionInitiateMessage(
+            type="session.initiate", 
+            conversationId="test-id",
+            expectAudioMessages=True,
+            botName="TestBot",
+            caller="+12345678901",
+            supportedMediaFormats=["raw/lpcm16"]
+        ).json(),
+        SessionEndMessage(
+            type="session.end", 
+            conversationId="test-id", 
+            reasonCode="normal", 
+            reason="Test ended"
+        ).json()
     ]
     return websocket
 
@@ -40,8 +60,19 @@ async def test_websocket_manager_initialization(websocket_manager):
 async def test_handle_websocket_flow(websocket_manager, websocket):
     """Test the full flow of handling a websocket connection"""
     # Create mocked handlers
-    connection_validate_handler = AsyncMock(return_value={"type": "connection.validated", "success": True})
-    session_initiate_handler = AsyncMock(return_value={"type": "session.accepted", "mediaFormat": "raw/lpcm16"})
+    connection_validate_handler = AsyncMock(
+        return_value=ConnectionValidatedResponse(
+            type="connection.validated",
+            success=True
+        )
+    )
+    session_initiate_handler = AsyncMock(
+        return_value=SessionAcceptedResponse(
+            type="session.accepted",
+            mediaFormat="raw/lpcm16",
+            conversationId="test-id"
+        )
+    )
     session_end_handler = AsyncMock(return_value=None)
     
     # Mock handlers dictionary
@@ -88,8 +119,15 @@ async def test_handle_unhandled_message_type(websocket_manager):
     # Create a websocket with an unknown message type
     websocket = AsyncMock(spec=WebSocket)
     websocket.receive_text.side_effect = [
+        # Need to create a valid JSON string for an unrecognized message type
         json.dumps({"type": "unknown.message.type", "conversationId": "test-id"}),
-        json.dumps({"type": "session.end", "conversationId": "test-id"})
+        # Valid message to end the session
+        SessionEndMessage(
+            type="session.end", 
+            conversationId="test-id", 
+            reasonCode="normal", 
+            reason="Test ended"
+        ).json()
     ]
     
     # Handle websocket connection

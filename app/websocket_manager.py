@@ -14,9 +14,10 @@ communications between the AudioCodes VoiceAI Connect platform and the voice bot
 
 import json
 import logging
-from typing import Any, Awaitable, Callable, Dict, Optional
+from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 from fastapi import WebSocket
+from pydantic import ValidationError
 
 from app.config.constants import LOGGER_NAME
 from app.handlers.activity_handlers import handle_activities
@@ -32,13 +33,25 @@ from app.handlers.stream_handlers import (
     handle_user_stream_stop,
 )
 from app.models.conversation import ConversationManager
+from app.models.message_schemas import (
+    ActivitiesMessage,
+    ConnectionValidateMessage,
+    IncomingMessage,
+    OutgoingMessage,
+    SessionEndMessage,
+    SessionInitiateMessage,
+    SessionResumeMessage,
+    UserStreamChunkMessage,
+    UserStreamStartMessage,
+    UserStreamStopMessage,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
 # Type hint for handler functions
 HandlerFunc = Callable[
     [Dict[str, Any], WebSocket, ConversationManager],
-    Awaitable[Optional[Dict[str, Any]]],
+    Awaitable[Optional[Union[Dict[str, Any], OutgoingMessage]]],
 ]
 
 
@@ -93,11 +106,37 @@ class WebSocketManager:
             while True:
                 # Receive the message
                 data = await websocket.receive_text()
-                message = json.loads(data)
+                message_dict = json.loads(data)
+
+                # Extract the message type
+                message_type = message_dict.get("type")
+
+                # Try to parse as a valid message model
+                typed_message = None
+                try:
+                    if message_type == "session.initiate":
+                        typed_message = SessionInitiateMessage(**message_dict)
+                    elif message_type == "session.resume":
+                        typed_message = SessionResumeMessage(**message_dict)
+                    elif message_type == "userStream.start":
+                        typed_message = UserStreamStartMessage(**message_dict)
+                    elif message_type == "userStream.chunk":
+                        typed_message = UserStreamChunkMessage(**message_dict)
+                    elif message_type == "userStream.stop":
+                        typed_message = UserStreamStopMessage(**message_dict)
+                    elif message_type == "activities":
+                        typed_message = ActivitiesMessage(**message_dict)
+                    elif message_type == "session.end":
+                        typed_message = SessionEndMessage(**message_dict)
+                    elif message_type == "connection.validate":
+                        typed_message = ConnectionValidateMessage(**message_dict)
+                    else:
+                        logger.warning(f"Unknown message type received: {message_type}")
+                except ValidationError as e:
+                    logger.error(f"Message validation error: {e}")
 
                 # Extract the conversation ID if available
-                conversation_id = message.get("conversationId")
-                message_type = message.get("type")
+                conversation_id = message_dict.get("conversationId")
 
                 logger.info(
                     f"Received message type: {message_type}"
@@ -112,7 +151,7 @@ class WebSocketManager:
                 if message_type in self.handlers:
                     handler = self.handlers[message_type]
                     response = await handler(
-                        message, websocket, self.conversation_manager
+                        message_dict, websocket, self.conversation_manager
                     )
 
                     # Special handling for session.end
@@ -123,8 +162,12 @@ class WebSocketManager:
                     if response and message_type not in [
                         "session.initiate"
                     ]:  # session.initiate handler sends its own response
-                        await websocket.send_text(json.dumps(response))
-                        logger.info(f"Sent response for {message_type}: {response}")
+                        # Check if response is a Pydantic model or a dict
+                        if hasattr(response, "json"):
+                            await websocket.send_text(response.json())
+                        else:
+                            await websocket.send_text(json.dumps(response))
+                        logger.info(f"Sent response for {message_type}")
                 else:
                     logger.warning(f"Unhandled message type received: {message_type}")
 

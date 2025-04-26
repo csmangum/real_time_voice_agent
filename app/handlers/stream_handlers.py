@@ -7,14 +7,24 @@ protocol defined in the AudioCodes Bot API WebSocket mode.
 """
 
 import base64
-import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
+from pydantic import ValidationError
 
 from app.config.constants import LOGGER_NAME
 from app.models.conversation import ConversationManager
+from app.models.message_schemas import (
+    PlayStreamChunkMessage,
+    PlayStreamStartMessage,
+    PlayStreamStopMessage,
+    UserStreamChunkMessage,
+    UserStreamStartedResponse,
+    UserStreamStartMessage,
+    UserStreamStopMessage,
+    UserStreamStoppedResponse,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -23,7 +33,7 @@ async def handle_user_stream_start(
     message: Dict[str, Any],
     websocket: WebSocket,
     conversation_manager: ConversationManager,
-) -> Dict[str, Any]:
+) -> UserStreamStartedResponse:
     """
     Handle the userStream.start message from AudioCodes VoiceAI Connect Enterprise.
 
@@ -39,11 +49,23 @@ async def handle_user_stream_start(
     Returns:
         A userStream.started response message
     """
-    # Signal that the bot is ready to receive audio chunks
-    logger.info(
-        f"User stream starting for conversation: {message.get('conversationId')}"
-    )
-    return {"type": "userStream.started"}
+    try:
+        # Validate incoming message
+        stream_start = UserStreamStartMessage(**message)
+        conversation_id = stream_start.conversationId
+
+        # Signal that the bot is ready to receive audio chunks
+        logger.info(f"User stream starting for conversation: {conversation_id}")
+
+        # Create response
+        return UserStreamStartedResponse(
+            type="userStream.started", conversationId=conversation_id
+        )
+
+    except ValidationError as e:
+        logger.error(f"Invalid userStream.start message: {e}")
+        # Return a basic response even if validation fails
+        return UserStreamStartedResponse(type="userStream.started")
 
 
 async def handle_user_stream_chunk(
@@ -65,20 +87,31 @@ async def handle_user_stream_chunk(
     Returns:
         None, though a real implementation might send hypothesis messages
     """
-    # Process the audio chunk (in a real implementation, this would handle speech recognition)
-    # Extract the audio data
-    audio_chunk = message.get("audioChunk", "")
-    # Here you would process the audio data, e.g., with a speech recognition engine
-    # For demonstration, we'll just log that we received a chunk
-    logger.debug(f"Processing audio chunk of length: {len(audio_chunk)}")
+    try:
+        # Validate incoming message
+        stream_chunk = UserStreamChunkMessage(**message)
 
-    # In a real implementation, you might want to send hypothesis messages during recognition
-    # Example:
-    # hypothesis_response = {
-    #     "type": "userStream.speech.hypothesis",
-    #     "alternatives": [{"text": "Partial recognition text"}]
-    # }
-    # await websocket.send_text(json.dumps(hypothesis_response))
+        # Process the audio chunk (in a real implementation, this would handle speech recognition)
+        # Extract the audio data
+        audio_chunk = stream_chunk.audioChunk
+        conversation_id = stream_chunk.conversationId
+
+        # Here you would process the audio data, e.g., with a speech recognition engine
+        # For demonstration, we'll just log that we received a chunk
+        logger.debug(f"Processing audio chunk of length: {len(audio_chunk)}")
+
+        # In a real implementation, you might want to send hypothesis messages during recognition
+        # Example:
+        # hypothesis_response = UserStreamHypothesisResponse(
+        #     type="userStream.speech.hypothesis",
+        #     alternatives=[{"text": "Partial recognition text"}],
+        #     conversationId=conversation_id
+        # )
+        # await websocket.send_text(hypothesis_response.json())
+
+    except ValidationError as e:
+        logger.error(f"Invalid userStream.chunk message: {e}")
+
     return None
 
 
@@ -86,7 +119,7 @@ async def handle_user_stream_stop(
     message: Dict[str, Any],
     websocket: WebSocket,
     conversation_manager: ConversationManager,
-) -> Dict[str, Any]:
+) -> UserStreamStoppedResponse:
     """
     Handle the userStream.stop message from AudioCodes VoiceAI Connect Enterprise.
 
@@ -101,15 +134,31 @@ async def handle_user_stream_stop(
     Returns:
         A userStream.stopped response message
     """
-    # Signal that the bot acknowledges the end of audio streaming
-    logger.info(
-        f"User stream stopping for conversation: {message.get('conversationId')}"
-    )
-    return {"type": "userStream.stopped"}
+    try:
+        # Validate incoming message
+        stream_stop = UserStreamStopMessage(**message)
+        conversation_id = stream_stop.conversationId
+
+        # Signal that the bot acknowledges the end of audio streaming
+        logger.info(f"User stream stopping for conversation: {conversation_id}")
+
+        # Create response
+        return UserStreamStoppedResponse(
+            type="userStream.stopped", conversationId=conversation_id
+        )
+
+    except ValidationError as e:
+        logger.error(f"Invalid userStream.stop message: {e}")
+        # Return a basic response even if validation fails
+        return UserStreamStoppedResponse(type="userStream.stopped")
 
 
 async def send_play_stream(
-    websocket: WebSocket, stream_id: str, media_format: str, audio_data: bytes
+    websocket: WebSocket,
+    stream_id: str,
+    media_format: str,
+    audio_data: bytes,
+    conversation_id: Optional[str] = None,
 ) -> None:
     """
     Send a playStream sequence to stream audio to the user.
@@ -127,28 +176,33 @@ async def send_play_stream(
         stream_id: A unique identifier for the Play Stream within the conversation
         media_format: The audio format (must be one of the supported formats)
         audio_data: The raw audio data to send
+        conversation_id: Optional conversation ID to include in messages
     """
     # Start the stream
-    start_message = {
-        "type": "playStream.start",
-        "streamId": stream_id,
-        "mediaFormat": media_format,
-    }
+    start_message = PlayStreamStartMessage(
+        type="playStream.start",
+        streamId=stream_id,
+        mediaFormat=media_format,
+        conversationId=conversation_id,
+    )
     logger.info(f"Starting play stream: {stream_id}")
-    await websocket.send_text(json.dumps(start_message))
+    await websocket.send_text(start_message.json())
 
     # Send audio chunks
     # In a real implementation, you would chunk the audio data
     # For simplicity, we're sending it all at once here
-    chunk_message = {
-        "type": "playStream.chunk",
-        "streamId": stream_id,
-        "audioChunk": base64.b64encode(audio_data).decode("utf-8"),
-    }
+    chunk_message = PlayStreamChunkMessage(
+        type="playStream.chunk",
+        streamId=stream_id,
+        audioChunk=base64.b64encode(audio_data).decode("utf-8"),
+        conversationId=conversation_id,
+    )
     logger.debug(f"Sending audio chunk for stream: {stream_id}")
-    await websocket.send_text(json.dumps(chunk_message))
+    await websocket.send_text(chunk_message.json())
 
     # Stop the stream
-    stop_message = {"type": "playStream.stop", "streamId": stream_id}
+    stop_message = PlayStreamStopMessage(
+        type="playStream.stop", streamId=stream_id, conversationId=conversation_id
+    )
     logger.info(f"Stopping play stream: {stream_id}")
-    await websocket.send_text(json.dumps(stop_message))
+    await websocket.send_text(stop_message.json())

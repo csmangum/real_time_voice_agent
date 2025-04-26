@@ -5,6 +5,8 @@ import pytest
 
 from app.handlers.activity_handlers import handle_activities, send_activities, hangup_call
 from app.models.conversation import ConversationManager
+from app.models.message_schemas import ActivityEvent, ActivitiesMessage
+from pydantic import ValidationError
 
 @pytest.mark.asyncio
 class TestActivityHandlers:
@@ -13,13 +15,14 @@ class TestActivityHandlers:
         # Setup
         websocket = AsyncMock()
         conversation_manager = MagicMock(spec=ConversationManager)
-        message = {
-            "conversationId": "test-conversation-id",
-            "activities": [{"type": "event", "name": "start"}]
-        }
+        message = ActivitiesMessage(
+            type="activities",
+            conversationId="test-conversation-id",
+            activities=[ActivityEvent(type="event", name="start")]
+        )
         
         # Execute
-        response = await handle_activities(message, websocket, conversation_manager)
+        response = await handle_activities(message.model_dump(), websocket, conversation_manager)
         
         # Assert
         assert response is None
@@ -28,13 +31,14 @@ class TestActivityHandlers:
         # Setup
         websocket = AsyncMock()
         conversation_manager = MagicMock(spec=ConversationManager)
-        message = {
-            "conversationId": "test-conversation-id",
-            "activities": [{"type": "event", "name": "dtmf", "value": "5"}]
-        }
+        message = ActivitiesMessage(
+            type="activities",
+            conversationId="test-conversation-id",
+            activities=[ActivityEvent(type="event", name="dtmf", value="5")]
+        )
         
         # Execute
-        response = await handle_activities(message, websocket, conversation_manager)
+        response = await handle_activities(message.model_dump(), websocket, conversation_manager)
         
         # Assert
         assert response is None
@@ -43,13 +47,14 @@ class TestActivityHandlers:
         # Setup
         websocket = AsyncMock()
         conversation_manager = MagicMock(spec=ConversationManager)
-        message = {
-            "conversationId": "test-conversation-id",
-            "activities": [{"type": "event", "name": "hangup"}]
-        }
+        message = ActivitiesMessage(
+            type="activities",
+            conversationId="test-conversation-id",
+            activities=[ActivityEvent(type="event", name="hangup")]
+        )
         
         # Execute
-        response = await handle_activities(message, websocket, conversation_manager)
+        response = await handle_activities(message.model_dump(), websocket, conversation_manager)
         
         # Assert
         assert response is None
@@ -58,9 +63,28 @@ class TestActivityHandlers:
         # Setup
         websocket = AsyncMock()
         conversation_manager = MagicMock(spec=ConversationManager)
+        # Testing with an unknown event - we'll still use the model but it will log a warning
+        message = ActivitiesMessage(
+            type="activities",
+            conversationId="test-conversation-id",
+            activities=[ActivityEvent(type="event", name="unknown_event")]
+        )
+        
+        # Execute
+        response = await handle_activities(message.model_dump(), websocket, conversation_manager)
+        
+        # Assert
+        assert response is None
+    
+    async def test_handle_activities_validation_error(self):
+        # Setup
+        websocket = AsyncMock()
+        conversation_manager = MagicMock(spec=ConversationManager)
+        # Invalid message structure
         message = {
+            "type": "activities",
             "conversationId": "test-conversation-id",
-            "activities": [{"type": "event", "name": "unknown_event"}]
+            # Missing activities list
         }
         
         # Execute
@@ -72,14 +96,17 @@ class TestActivityHandlers:
     async def test_send_activities(self):
         # Setup
         websocket = AsyncMock()
-        activities = [{"type": "event", "name": "test_event"}]
+        activities = [ActivityEvent(type="event", name="test_event")]
         
         # Execute
         await send_activities(websocket, activities)
         
         # Assert
-        expected_message = {"type": "activities", "activities": activities}
-        websocket.send_text.assert_called_once_with(json.dumps(expected_message))
+        expected_message = ActivitiesMessage(
+            type="activities", 
+            activities=activities
+        )
+        websocket.send_text.assert_called_once_with(expected_message.json())
     
     async def test_hangup_call(self):
         # Setup
@@ -89,5 +116,8 @@ class TestActivityHandlers:
         await hangup_call(websocket)
         
         # Assert
-        expected_message = {"type": "activities", "activities": [{"type": "event", "name": "hangup"}]}
-        websocket.send_text.assert_called_once_with(json.dumps(expected_message)) 
+        expected_message = ActivitiesMessage(
+            type="activities", 
+            activities=[ActivityEvent(type="event", name="hangup")]
+        )
+        websocket.send_text.assert_called_once_with(expected_message.json()) 

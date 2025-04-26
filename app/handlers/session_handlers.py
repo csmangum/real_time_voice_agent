@@ -8,12 +8,22 @@ messages according to the AudioCodes Bot API WebSocket protocol.
 
 import json
 import logging
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from fastapi import WebSocket
+from pydantic import ValidationError
 
 from app.config.constants import LOGGER_NAME
 from app.models.conversation import ConversationManager
+from app.models.message_schemas import (
+    ConnectionValidatedResponse,
+    ConnectionValidateMessage,
+    SessionAcceptedResponse,
+    SessionEndMessage,
+    SessionErrorResponse,
+    SessionInitiateMessage,
+    SessionResumeMessage,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -22,7 +32,7 @@ async def handle_session_initiate(
     message: Dict[str, Any],
     websocket: WebSocket,
     conversation_manager: ConversationManager,
-) -> Dict[str, Any]:
+) -> SessionAcceptedResponse | SessionErrorResponse:
     """
     Handle the session.initiate message from AudioCodes VoiceAI Connect Enterprise.
 
@@ -45,36 +55,53 @@ async def handle_session_initiate(
     Returns:
         A session.accepted response or session.error if formats don't match
     """
-    # Extract the supported media formats
-    supported_formats = message.get("supportedMediaFormats", [])
-    logger.info(f"Supported formats: {supported_formats}")
-    conversation_id = message.get("conversationId")
+    try:
+        # Validate incoming message
+        session_message = SessionInitiateMessage(**message)
 
-    # Check if the required format is supported
-    if "raw/lpcm16" in supported_formats:
-        # Send the session.accepted response
-        response = {"type": "session.accepted", "mediaFormat": "raw/lpcm16"}
-        logger.info(f"Accepting session with format: raw/lpcm16")
-        await websocket.send_text(json.dumps(response))
+        # Extract the supported media formats
+        supported_formats = session_message.supportedMediaFormats
+        logger.info(f"Supported formats: {supported_formats}")
+        conversation_id = session_message.conversationId
 
-        # Add the conversation to the manager
-        if conversation_id:
-            conversation_manager.add_conversation(
-                conversation_id, websocket, "raw/lpcm16"
+        # Check if the required format is supported
+        if "raw/lpcm16" in supported_formats:
+            # Create session.accepted response
+            response = SessionAcceptedResponse(
+                type="session.accepted",
+                mediaFormat="raw/lpcm16",
+                conversationId=conversation_id,
             )
-            logger.info(
-                f"New conversation added: {conversation_id} with media format: raw/lpcm16"
-            )
+            logger.info(f"Accepting session with format: raw/lpcm16")
+            await websocket.send_text(response.json())
 
-        return response
-    else:
-        # If the required format is not supported, send an error
-        error_response = {
-            "type": "session.error",
-            "reason": "Required media format not supported",
-        }
-        logger.warning(f"Rejecting session due to unsupported media format")
-        await websocket.send_text(json.dumps(error_response))
+            # Add the conversation to the manager
+            if conversation_id:
+                conversation_manager.add_conversation(
+                    conversation_id, websocket, "raw/lpcm16"
+                )
+                logger.info(
+                    f"New conversation added: {conversation_id} with media format: raw/lpcm16"
+                )
+
+            return response
+        else:
+            # If the required format is not supported, send an error
+            error_response = SessionErrorResponse(
+                type="session.error",
+                reason="Required media format not supported",
+                conversationId=conversation_id,
+            )
+            logger.warning(f"Rejecting session due to unsupported media format")
+            await websocket.send_text(error_response.json())
+            return error_response
+
+    except ValidationError as e:
+        logger.error(f"Invalid session.initiate message: {e}")
+        error_response = SessionErrorResponse(
+            type="session.error", reason="Invalid message format"
+        )
+        await websocket.send_text(error_response.json())
         return error_response
 
 
@@ -82,7 +109,7 @@ async def handle_session_resume(
     message: Dict[str, Any],
     websocket: WebSocket,
     conversation_manager: ConversationManager,
-) -> Dict[str, Any]:
+) -> SessionAcceptedResponse | SessionErrorResponse:
     """
     Handle the session.resume message from AudioCodes VoiceAI Connect Enterprise.
 
@@ -98,14 +125,28 @@ async def handle_session_resume(
     Returns:
         A session.accepted response message
     """
-    # Handle session resume similarly to session initiate
-    # In a real implementation, you would restore the session state
-    logger.info(f"Resuming session for conversation: {message.get('conversationId')}")
-    response = {
-        "type": "session.accepted",
-        "mediaFormat": "raw/lpcm16",  # Ideally use the same format as before
-    }
-    return response
+    try:
+        # Validate incoming message
+        session_message = SessionResumeMessage(**message)
+        conversation_id = session_message.conversationId
+
+        logger.info(f"Resuming session for conversation: {conversation_id}")
+
+        # Create the session.accepted response
+        response = SessionAcceptedResponse(
+            type="session.accepted",
+            mediaFormat="raw/lpcm16",  # Ideally use the same format as before
+            conversationId=conversation_id,
+        )
+        return response
+
+    except ValidationError as e:
+        logger.error(f"Invalid session.resume message: {e}")
+        error_response = SessionErrorResponse(
+            type="session.error", reason="Invalid message format"
+        )
+        await websocket.send_text(error_response.json())
+        return error_response
 
 
 async def handle_session_end(
@@ -127,27 +168,34 @@ async def handle_session_end(
     Returns:
         None, as no response is expected
     """
-    conversation_id = message.get("conversationId")
-    reason_code = message.get("reasonCode", "")
-    reason = message.get("reason", "")
+    try:
+        # Validate incoming message
+        session_end = SessionEndMessage(**message)
+        conversation_id = session_end.conversationId
+        reason_code = session_end.reasonCode
+        reason = session_end.reason
 
-    logger.info(
-        f"Session ended: {reason_code} - {reason} for conversation: {conversation_id}"
-    )
+        logger.info(
+            f"Session ended: {reason_code} - {reason} for conversation: {conversation_id}"
+        )
 
-    # Remove the conversation from the manager
-    if conversation_id:
-        conversation_manager.remove_conversation(conversation_id)
-        logger.info(f"Conversation removed: {conversation_id}")
+        # Remove the conversation from the manager
+        if conversation_id:
+            conversation_manager.remove_conversation(conversation_id)
+            logger.info(f"Conversation removed: {conversation_id}")
 
-    return None
+        return None
+
+    except ValidationError as e:
+        logger.error(f"Invalid session.end message: {e}")
+        return None
 
 
 async def handle_connection_validate(
     message: Dict[str, Any],
     websocket: WebSocket,
     conversation_manager: ConversationManager,
-) -> Dict[str, Any]:
+) -> ConnectionValidatedResponse:
     """
     Handle the connection.validate message from AudioCodes VoiceAI Connect Enterprise.
 
@@ -162,5 +210,19 @@ async def handle_connection_validate(
     Returns:
         A connection.validated response with success=True
     """
-    logger.info("Handling connection validation request")
-    return {"type": "connection.validated", "success": True}
+    try:
+        # Validate incoming message
+        connection_message = ConnectionValidateMessage(**message)
+        conversation_id = connection_message.conversationId
+
+        logger.info("Handling connection validation request")
+
+        # Create the connection.validated response
+        return ConnectionValidatedResponse(
+            type="connection.validated", success=True, conversationId=conversation_id
+        )
+
+    except ValidationError as e:
+        logger.error(f"Invalid connection.validate message: {e}")
+        # Even for invalid messages, we'll return a success response
+        return ConnectionValidatedResponse(type="connection.validated", success=True)

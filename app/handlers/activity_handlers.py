@@ -6,14 +6,15 @@ initiation events, DTMF inputs, and hangup requests. It also provides functions
 to send activities to the client for controlling call flow.
 """
 
-import json
 import logging
 from typing import Any, Dict, List, Optional
 
 from fastapi import WebSocket
+from pydantic import ValidationError
 
 from app.config.constants import LOGGER_NAME
 from app.models.conversation import ConversationManager
+from app.models.message_schemas import ActivitiesMessage, ActivityEvent
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -22,7 +23,7 @@ async def handle_activities(
     message: Dict[str, Any],
     websocket: WebSocket,
     conversation_manager: ConversationManager,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[None]:
     """
     Handle the activities messages from AudioCodes VoiceAI Connect Enterprise.
 
@@ -37,45 +38,63 @@ async def handle_activities(
     Returns:
         None as activities typically don't require a direct response
     """
-    activities = message.get("activities", [])
-    conversation_id = message.get("conversationId")
+    try:
+        # Validate incoming message
+        activities_message = ActivitiesMessage(**message)
+        activities = activities_message.activities
+        conversation_id = activities_message.conversationId
 
-    for activity in activities:
-        activity_type = activity.get("type")
+        for activity in activities:
+            activity_type = activity.type
 
-        if activity_type == "event":
-            event_name = activity.get("name")
+            if activity_type == "event":
+                event_name = activity.name
 
-            if event_name == "start":
-                # Handle call initiation
-                logger.info(f"Call initiated for conversation: {conversation_id}")
-                # No specific response needed
+                if event_name == "start":
+                    # Handle call initiation
+                    logger.info(f"Call initiated for conversation: {conversation_id}")
+                    # No specific response needed
 
-            elif event_name == "dtmf":
-                # Handle DTMF input
-                dtmf_value = activity.get("value", "")
-                logger.info(
-                    f"Received DTMF: {dtmf_value} for conversation: {conversation_id}"
-                )
-                # No specific response needed
+                elif event_name == "dtmf":
+                    # Handle DTMF input
+                    dtmf_value = activity.value or ""
+                    logger.info(
+                        f"Received DTMF: {dtmf_value} for conversation: {conversation_id}"
+                    )
+                    # No specific response needed
 
-            elif event_name == "hangup":
-                logger.info(
-                    f"Hangup event received for conversation: {conversation_id}"
-                )
-                # You might want to clean up resources here
+                elif event_name == "hangup":
+                    logger.info(
+                        f"Hangup event received for conversation: {conversation_id}"
+                    )
+                    # You might want to clean up resources here
 
+                else:
+                    logger.info(f"Unhandled event type: {event_name}")
             else:
-                logger.info(f"Unhandled event type: {event_name}")
-        else:
-            logger.info(f"Unhandled activity type: {activity_type}")
+                logger.info(f"Unhandled activity type: {activity_type}")
+
+    except ValidationError as e:
+        logger.error(f"Invalid activities message: {e}")
+        # Try to process without validation
+        activities = message.get("activities", [])
+        conversation_id = message.get("conversationId")
+
+        for activity in activities:
+            activity_type = activity.get("type")
+
+            if activity_type == "event":
+                event_name = activity.get("name")
+                logger.info(f"Processing unvalidated event: {event_name}")
 
     # Activities don't typically require a response
     return None
 
 
 async def send_activities(
-    websocket: WebSocket, activities: List[Dict[str, Any]]
+    websocket: WebSocket,
+    activities: List[ActivityEvent],
+    conversation_id: Optional[str] = None,
 ) -> None:
     """
     Send activities to the AudioCodes VoiceAI Connect Enterprise client.
@@ -85,13 +104,19 @@ async def send_activities(
     Args:
         websocket: The WebSocket connection to send through
         activities: List of activity objects to send
+        conversation_id: Optional conversation ID to include in message
     """
-    message = {"type": "activities", "activities": activities}
+    # Create the activities message
+    message = ActivitiesMessage(
+        type="activities", activities=activities, conversationId=conversation_id
+    )
     logger.info(f"Sending activities: {activities}")
-    await websocket.send_text(json.dumps(message))
+    await websocket.send_text(message.json())
 
 
-async def hangup_call(websocket: WebSocket) -> None:
+async def hangup_call(
+    websocket: WebSocket, conversation_id: Optional[str] = None
+) -> None:
     """
     Send a hangup activity to end the call.
 
@@ -100,7 +125,9 @@ async def hangup_call(websocket: WebSocket) -> None:
 
     Args:
         websocket: The WebSocket connection to send through
+        conversation_id: Optional conversation ID to include in message
     """
-    hangup_activity = [{"type": "event", "name": "hangup"}]
+    # Create the hangup activity
+    hangup_activity = [ActivityEvent(type="event", name="hangup")]
     logger.info("Sending hangup activity")
-    await send_activities(websocket, hangup_activity)
+    await send_activities(websocket, hangup_activity, conversation_id)
