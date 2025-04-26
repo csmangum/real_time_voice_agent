@@ -251,7 +251,7 @@ class ActivityEvent(BaseModel):
     @field_validator("value")
     def validate_value(cls, v, values):
         """Validate that value is appropriate for the event type."""
-        if values.get("name") == "dtmf" and v is not None:
+        if values.data.get("name") == "dtmf" and v is not None:
             if not v in "0123456789*#ABCD":
                 raise ValueError(f"Invalid DTMF value: {v}")
         return v
