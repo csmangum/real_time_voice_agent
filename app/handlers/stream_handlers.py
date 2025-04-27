@@ -6,9 +6,10 @@ and provides functions to stream audio back to the user. It implements the audio
 protocol defined in the AudioCodes Bot API WebSocket mode.
 """
 
+import asyncio
 import base64
 import logging
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import WebSocket
 from pydantic import ValidationError
@@ -27,6 +28,12 @@ from app.models.message_schemas import (
 )
 
 logger = logging.getLogger(LOGGER_NAME)
+
+# Default chunk size for audio data (bytes)
+DEFAULT_CHUNK_SIZE = 4000
+
+# No delay between chunks for real-time streaming
+DEFAULT_CHUNK_DELAY = 0.0  # 0 seconds - no delay
 
 
 async def handle_user_stream_start(
@@ -153,19 +160,30 @@ async def handle_user_stream_stop(
         return UserStreamStoppedResponse(type="userStream.stopped")
 
 
+def chunk_audio_data(audio_data: bytes, chunk_size: int = DEFAULT_CHUNK_SIZE) -> List[bytes]:
+    """Split audio data into chunks of specified size."""
+    chunks = []
+    for i in range(0, len(audio_data), chunk_size):
+        chunks.append(audio_data[i:i + chunk_size])
+    logger.info(f"Split audio into {len(chunks)} chunks of ~{chunk_size} bytes each")
+    return chunks
+
+
 async def send_play_stream(
     websocket: WebSocket,
     stream_id: str,
     media_format: str,
     audio_data: bytes,
     conversation_id: Optional[str] = None,
+    chunk_size: int = DEFAULT_CHUNK_SIZE,
+    chunk_delay: float = DEFAULT_CHUNK_DELAY,
 ) -> None:
     """
     Send a playStream sequence to stream audio to the user.
 
     The sequence consists of:
     1. playStream.start - Initiates the audio stream with a unique ID
-    2. playStream.chunk - Sends the audio data encoded in base64
+    2. Multiple playStream.chunk - Sends the audio data in chunks, encoded in base64
     3. playStream.stop - Ends the audio stream
 
     Only one Play Stream can be active at a time. Before starting a new stream,
@@ -177,6 +195,8 @@ async def send_play_stream(
         media_format: The audio format (must be one of the supported formats)
         audio_data: The raw audio data to send
         conversation_id: Optional conversation ID to include in messages
+        chunk_size: Size of each audio chunk in bytes
+        chunk_delay: Delay between chunks in seconds (to control streaming rate)
     """
     # Start the stream
     start_message = PlayStreamStartMessage(
@@ -188,21 +208,42 @@ async def send_play_stream(
     logger.info(f"Starting play stream: {stream_id}")
     await websocket.send_text(start_message.json())
 
-    # Send audio chunks
-    # In a real implementation, you would chunk the audio data
-    # For simplicity, we're sending it all at once here
-    chunk_message = PlayStreamChunkMessage(
-        type="playStream.chunk",
-        streamId=stream_id,
-        audioChunk=base64.b64encode(audio_data).decode("utf-8"),
-        conversationId=conversation_id,
-    )
-    logger.debug(f"Sending audio chunk for stream: {stream_id}")
-    await websocket.send_text(chunk_message.json())
+    try:
+        # Split audio data into chunks
+        audio_chunks = chunk_audio_data(audio_data, chunk_size)
+        
+        # Send each chunk with no delay for real-time streaming
+        start_send_time = asyncio.get_event_loop().time()
+        for i, chunk in enumerate(audio_chunks):
+            chunk_message = PlayStreamChunkMessage(
+                type="playStream.chunk",
+                streamId=stream_id,
+                audioChunk=base64.b64encode(chunk).decode("utf-8"),
+                conversationId=conversation_id,
+            )
+            # Log progress at regular intervals
+            if i % 100 == 0:
+                elapsed = asyncio.get_event_loop().time() - start_send_time
+                logger.info(f"Sent {i}/{len(audio_chunks)} chunks ({i/len(audio_chunks)*100:.1f}%) in {elapsed:.2f} seconds")
+            
+            await websocket.send_text(chunk_message.json())
+            
+            # No delay between chunks for real-time performance
 
-    # Stop the stream
-    stop_message = PlayStreamStopMessage(
-        type="playStream.stop", streamId=stream_id, conversationId=conversation_id
-    )
-    logger.info(f"Stopping play stream: {stream_id}")
-    await websocket.send_text(stop_message.json())
+        # Calculate and log total send time
+        total_send_time = asyncio.get_event_loop().time() - start_send_time
+        logger.info(f"Finished sending {len(audio_chunks)} audio chunks for stream: {stream_id} in {total_send_time:.2f} seconds")
+        
+        # Calculate the approximate playback rate
+        audio_duration = 13.7  # Approximate duration of sample.wav in seconds
+        rate_factor = audio_duration / total_send_time if total_send_time > 0 else 0
+        logger.info(f"Stream rate: {rate_factor:.2f}x real-time ({audio_duration:.1f}s of audio in {total_send_time:.2f}s)")
+    except Exception as e:
+        logger.error(f"Error sending audio chunks: {e}", exc_info=True)
+    finally:
+        # Always stop the stream, even if there was an error
+        stop_message = PlayStreamStopMessage(
+            type="playStream.stop", streamId=stream_id, conversationId=conversation_id
+        )
+        logger.info(f"Stopping play stream: {stream_id}")
+        await websocket.send_text(stop_message.json())
