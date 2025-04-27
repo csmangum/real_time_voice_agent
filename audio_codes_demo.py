@@ -118,14 +118,36 @@ async def simulate_audio_stream(websocket, conversation_id: str) -> None:
     logger.info(f"Starting audio stream for conversation: {conversation_id}")
     await websocket.send(json.dumps(start_message))
 
-    # Wait for userStream.started response
+    # Wait for response
     response = await websocket.recv()
     response_data = json.loads(response)
     logger.info(f"Received response to userStream.start: {response_data['type']}")
     logger.debug(f"Response content: {json.dumps(response_data, indent=2)}")
 
-    if response_data.get("type") == "userStream.started":
-        # Step 2: Send audio chunks
+    # Handle both userStream.started and playStream.start responses
+    if (
+        response_data.get("type") == "userStream.started"
+        or response_data.get("type") == "playStream.start"
+    ):
+        if response_data.get("type") == "playStream.start":
+            logger.info(
+                f"Server is starting to play audio stream: {response_data.get('streamId')}"
+            )
+            # Wait for and process any audio chunks coming from the server
+            try:
+                # Set a timeout for receiving server audio to avoid blocking indefinitely
+                for _ in range(5):  # Try to receive up to 5 messages with a timeout
+                    try:
+                        response = await asyncio.wait_for(websocket.recv(), timeout=0.5)
+                        response_data = json.loads(response)
+                        logger.info(f"Received server message: {response_data['type']}")
+                    except asyncio.TimeoutError:
+                        logger.info("No more audio data from server")
+                        break
+            except Exception as e:
+                logger.warning(f"Error receiving server audio: {e}")
+
+        # Step 2: Send audio chunks from client
         logger.info("Sending audio chunks")
         # In a real scenario, these would be actual audio data
         for i in range(3):
@@ -148,12 +170,17 @@ async def simulate_audio_stream(websocket, conversation_id: str) -> None:
         await websocket.send(json.dumps(stop_message))
 
         # Wait for userStream.stopped response
-        response = await websocket.recv()
-        response_data = json.loads(response)
-        logger.info(f"Received response to userStream.stop: {response_data['type']}")
-        logger.debug(f"Response content: {json.dumps(response_data, indent=2)}")
+        try:
+            response = await asyncio.wait_for(websocket.recv(), timeout=1.0)
+            response_data = json.loads(response)
+            logger.info(
+                f"Received response to userStream.stop: {response_data['type']}"
+            )
+            logger.debug(f"Response content: {json.dumps(response_data, indent=2)}")
+        except asyncio.TimeoutError:
+            logger.info("No response received for userStream.stop")
     else:
-        logger.warning(f"Failed to start audio stream: {response_data}")
+        logger.warning(f"Unexpected response to audio stream start: {response_data}")
 
 
 async def send_dtmf(websocket, conversation_id: str, digits: str) -> None:
