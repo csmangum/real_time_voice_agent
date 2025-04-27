@@ -1,6 +1,6 @@
 import json
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch, call
 
 from fastapi import WebSocket
 
@@ -9,7 +9,12 @@ from app.models.conversation import ConversationManager
 from app.models.message_schemas import (
     ConnectionValidateMessage,
     SessionInitiateMessage,
+    SessionResumeMessage,
     SessionEndMessage,
+    UserStreamStartMessage,
+    UserStreamChunkMessage,
+    UserStreamStopMessage,
+    ActivitiesMessage,
     ConnectionValidatedResponse,
     SessionAcceptedResponse
 )
@@ -139,4 +144,236 @@ async def test_handle_unhandled_message_type(websocket_manager):
     
     # Assert no response was sent for the unknown message type
     # (The call count should be 0 since we mocked all handlers)
-    assert websocket.send_text.call_count == 0 
+    assert websocket.send_text.call_count == 0
+
+@pytest.mark.asyncio
+async def test_handle_user_stream_start():
+    """Test handling of userStream.start message"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    conversation_manager = ConversationManager()
+    msg = UserStreamStartMessage(
+        type="userStream.start",
+        conversationId="test-id",
+        userStream={
+            "mediaFormat": "raw/lpcm16",
+            "sampleRate": 16000
+        }
+    )
+    
+    # Create a conversation first (required for user stream messages)
+    conversation_manager.add_conversation("test-id", websocket, "raw/lpcm16")
+    
+    # Test with patched handlers
+    with patch('app.handlers.stream_handlers.handle_user_stream_start') as mock_handler:
+        # Create expected response
+        mock_response = {"type": "userStream.started", "conversationId": "test-id"}
+        mock_handler.return_value = mock_response
+        
+        # Call handler
+        from app.handlers.stream_handlers import handle_user_stream_start
+        response = await handle_user_stream_start(json.loads(msg.json()), websocket, conversation_manager)
+        
+        # Verify
+        assert response == mock_response
+        mock_handler.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_handle_user_stream_chunk():
+    """Test handling of userStream.chunk message"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    conversation_manager = ConversationManager()
+    msg = UserStreamChunkMessage(
+        type="userStream.chunk",
+        conversationId="test-id",
+        audioChunk="aGVsbG8="  # Valid base64 encoding of "hello"
+    )
+    
+    # Create a conversation first
+    conversation_manager.add_conversation("test-id", websocket, "raw/lpcm16")
+    
+    # Test with patched handlers
+    with patch('app.handlers.stream_handlers.handle_user_stream_chunk') as mock_handler:
+        mock_handler.return_value = None  # No response for chunk messages
+        
+        # Call handler
+        from app.handlers.stream_handlers import handle_user_stream_chunk
+        response = await handle_user_stream_chunk(json.loads(msg.json()), websocket, conversation_manager)
+        
+        # Verify
+        assert response is None
+        mock_handler.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_handle_session_resume():
+    """Test handling of session.resume message"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    conversation_manager = ConversationManager()
+    msg = SessionResumeMessage(
+        type="session.resume",
+        conversationId="test-id"
+    )
+    
+    # Test with patched handlers
+    with patch('app.handlers.session_handlers.handle_session_resume') as mock_handler:
+        mock_response = {"type": "session.resumed", "conversationId": "test-id"}
+        mock_handler.return_value = mock_response
+        
+        # Call handler
+        from app.handlers.session_handlers import handle_session_resume
+        response = await handle_session_resume(json.loads(msg.json()), websocket, conversation_manager)
+        
+        # Verify
+        assert response == mock_response
+        mock_handler.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_handle_activities():
+    """Test handling of activities message"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    conversation_manager = ConversationManager()
+    msg = ActivitiesMessage(
+        type="activities",
+        conversationId="test-id",
+        activities=[
+            {
+                "type": "event",
+                "name": "dtmf",
+                "value": "1"
+            }
+        ]
+    )
+    
+    # Create a conversation first
+    conversation_manager.add_conversation("test-id", websocket, "raw/lpcm16")
+    
+    # Test with patched handlers
+    with patch('app.handlers.activity_handlers.handle_activities') as mock_handler:
+        mock_response = {"type": "activities.processed", "conversationId": "test-id"}
+        mock_handler.return_value = mock_response
+        
+        # Call handler
+        from app.handlers.activity_handlers import handle_activities
+        response = await handle_activities(json.loads(msg.json()), websocket, conversation_manager)
+        
+        # Verify
+        assert response == mock_response
+        mock_handler.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_invalid_message_validation():
+    """Test handling of messages that fail validation"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    websocket_manager = WebSocketManager()
+    
+    # Create an invalid message (missing required fields)
+    invalid_message = json.dumps({"type": "session.initiate"})  # Missing required fields
+    valid_end_message = SessionEndMessage(
+        type="session.end", 
+        conversationId="test-id", 
+        reasonCode="normal", 
+        reason="Test ended"
+    ).json()
+    
+    websocket.receive_text.side_effect = [invalid_message, valid_end_message]
+    
+    # Run test
+    await websocket_manager.handle_websocket(websocket)
+    
+    # Verify no error was thrown and the connection was handled
+    websocket.accept.assert_called_once()
+    websocket.close.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_conversation_cleanup_on_error():
+    """Test that conversation is cleaned up when an error occurs"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    websocket_manager = WebSocketManager()
+    
+    # Mock the conversation manager
+    websocket_manager.conversation_manager.remove_conversation = AsyncMock()
+    
+    # First message creates a conversation, second raises an error
+    websocket.receive_text.side_effect = [
+        SessionInitiateMessage(
+            type="session.initiate", 
+            conversationId="test-id",
+            expectAudioMessages=True,
+            botName="TestBot",
+            caller="+12345678901",
+            supportedMediaFormats=["raw/lpcm16"]
+        ).json(),
+        Exception("Test exception")
+    ]
+    
+    # Run test
+    await websocket_manager.handle_websocket(websocket)
+    
+    # Verify cleanup was attempted
+    websocket_manager.conversation_manager.remove_conversation.assert_called_once_with("test-id")
+    websocket.close.assert_called_once()
+
+@pytest.mark.asyncio
+async def test_multiple_messages_handling():
+    """Test handling of multiple consecutive messages"""
+    # Setup
+    websocket = AsyncMock(spec=WebSocket)
+    websocket_manager = WebSocketManager()
+    
+    # Create a series of messages in a conversation
+    messages = [
+        ConnectionValidateMessage(type="connection.validate").json(),
+        SessionInitiateMessage(
+            type="session.initiate", 
+            conversationId="test-id",
+            expectAudioMessages=True,
+            botName="TestBot",
+            caller="+12345678901",
+            supportedMediaFormats=["raw/lpcm16"]
+        ).json(),
+        UserStreamStartMessage(
+            type="userStream.start",
+            conversationId="test-id",
+            userStream={"mediaFormat": "raw/lpcm16", "sampleRate": 16000}
+        ).json(),
+        UserStreamChunkMessage(
+            type="userStream.chunk",
+            conversationId="test-id",
+            audioChunk="aGVsbG8="  # Valid base64 encoding of "hello"
+        ).json(),
+        UserStreamStopMessage(
+            type="userStream.stop",
+            conversationId="test-id"
+        ).json(),
+        SessionEndMessage(
+            type="session.end", 
+            conversationId="test-id", 
+            reasonCode="normal", 
+            reason="Test ended"
+        ).json()
+    ]
+    
+    websocket.receive_text.side_effect = messages
+    
+    # Mock all handlers
+    for handler_name in websocket_manager.handlers:
+        websocket_manager.handlers[handler_name] = AsyncMock(return_value=None)
+    
+    # Run test
+    await websocket_manager.handle_websocket(websocket)
+    
+    # Verify all handlers were called
+    assert websocket_manager.handlers["connection.validate"].call_count == 1
+    assert websocket_manager.handlers["session.initiate"].call_count == 1
+    assert websocket_manager.handlers["userStream.start"].call_count == 1
+    assert websocket_manager.handlers["userStream.chunk"].call_count == 1
+    assert websocket_manager.handlers["userStream.stop"].call_count == 1
+    assert websocket_manager.handlers["session.end"].call_count == 1
+    
+    # Verify websocket was closed at the end
+    websocket.close.assert_called_once() 
