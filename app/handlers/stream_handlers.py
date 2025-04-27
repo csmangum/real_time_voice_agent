@@ -26,6 +26,7 @@ from app.models.message_schemas import (
     UserStreamStopMessage,
     UserStreamStoppedResponse,
 )
+from app.bot.audiocodes_realtime_bridge import bridge
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -64,6 +65,14 @@ async def handle_user_stream_start(
         # Signal that the bot is ready to receive audio chunks
         logger.info(f"User stream starting for conversation: {conversation_id}")
 
+        # Ensure OpenAI client is initialized for this conversation
+        if conversation_id not in bridge.clients:
+            try:
+                await bridge.create_client(conversation_id, websocket)
+                logger.info(f"Created OpenAI Realtime client for conversation: {conversation_id}")
+            except Exception as e:
+                logger.error(f"Failed to initialize OpenAI client: {e}", exc_info=True)
+
         # Create response
         return UserStreamStartedResponse(
             type="userStream.started", conversationId=conversation_id
@@ -84,7 +93,7 @@ async def handle_user_stream_chunk(
     Handle the userStream.chunk message from AudioCodes VoiceAI Connect Enterprise.
 
     This message contains streamed audio data from the user.
-    In a full implementation, this would process the audio with speech recognition.
+    The audio is forwarded to OpenAI Realtime API for processing.
 
     Args:
         message: The userStream.chunk message containing the audioChunk in base64 encoding
@@ -92,32 +101,24 @@ async def handle_user_stream_chunk(
         conversation_manager: Manager for tracking active conversations
 
     Returns:
-        None, though a real implementation might send hypothesis messages
+        None, as responses are handled asynchronously
     """
     try:
         # Validate incoming message
         stream_chunk = UserStreamChunkMessage(**message)
 
-        # Process the audio chunk (in a real implementation, this would handle speech recognition)
         # Extract the audio data
         audio_chunk = stream_chunk.audioChunk
         conversation_id = stream_chunk.conversationId
 
-        # Here you would process the audio data, e.g., with a speech recognition engine
-        # For demonstration, we'll just log that we received a chunk
-        logger.debug(f"Processing audio chunk of length: {len(audio_chunk)}")
-
-        # In a real implementation, you might want to send hypothesis messages during recognition
-        # Example:
-        # hypothesis_response = UserStreamHypothesisResponse(
-        #     type="userStream.speech.hypothesis",
-        #     alternatives=[{"text": "Partial recognition text"}],
-        #     conversationId=conversation_id
-        # )
-        # await websocket.send_text(hypothesis_response.json())
+        # Forward audio chunk to OpenAI via the bridge
+        await bridge.send_audio_chunk(conversation_id, audio_chunk)
+        logger.debug(f"Forwarded audio chunk to OpenAI for conversation: {conversation_id}")
 
     except ValidationError as e:
         logger.error(f"Invalid userStream.chunk message: {e}")
+    except Exception as e:
+        logger.error(f"Error forwarding audio to OpenAI: {e}", exc_info=True)
 
     return None
 

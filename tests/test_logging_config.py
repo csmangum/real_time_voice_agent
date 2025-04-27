@@ -9,19 +9,17 @@ class TestLoggingConfig(unittest.TestCase):
         self.assertIsInstance(logger, logging.Logger)
         
         # Test that the logger has the correct name
-        self.assertEqual(logger.name, "ac_server")
+        self.assertEqual(logger.name, "voice_agent")
         
         # Test that the logger has the correct level
         self.assertEqual(logger.level, logging.INFO)
         
-        # Test that the root logger has the correct format
-        root_logger = logging.getLogger()
-        self.assertEqual(len(root_logger.handlers), 1)
-        handler = root_logger.handlers[0]
+        # Test that the logger has the correct handlers and format
+        self.assertGreaterEqual(len(logger.handlers), 1)  # At least one handler (console)
+        handler = logger.handlers[0]  # Check first handler (should be console handler)
         self.assertIsInstance(handler, logging.StreamHandler)
         formatter = handler.formatter
         self.assertEqual(formatter._fmt, "%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-        self.assertEqual(formatter.datefmt, "%Y-%m-%d %H:%M:%S")
 
 if __name__ == "__main__":
     unittest.main() 

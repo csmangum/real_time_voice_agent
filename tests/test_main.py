@@ -9,7 +9,11 @@ def test_health_check():
     """Test the health check endpoint returns correct response"""
     response = client.get("/health")
     assert response.status_code == 200
-    assert response.json() == {"status": "healthy"}
+    
+    response_json = response.json()
+    assert response_json["status"] == "healthy"
+    assert "openai_api_key_configured" in response_json
+    assert isinstance(response_json["openai_api_key_configured"], bool)
     
 def test_websocket_endpoint_initialization():
     """Test that websocket_manager is properly initialized"""

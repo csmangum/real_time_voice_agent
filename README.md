@@ -1,99 +1,99 @@
-# AudioCodes Bot API Implementation
+# Real-Time Voice Agent
 
-This project implements a WebSocket-based server and client that demonstrate the AudioCodes Bot API for voice bots.
+A real-time voice agent that integrates AudioCodes VoiceAI Connect Enterprise with OpenAI Realtime API for speech-to-speech conversations.
 
-## Components
+## Overview
 
-- `app/` - Directory containing the server implementation
-  - `main.py` - FastAPI application with WebSocket endpoint
-  - `websocket_manager.py` - Handles WebSocket connections and message routing
-  - `handlers/` - Message type-specific handlers
-  - `models/` - Data models for request/response validation
-  - `services/` - Business logic services
-  - `config/` - Application configuration
-- `client.py` - Client implementation to test and demonstrate the server functionality
-- `run.py` - Convenience script to start the server with hot-reload
+This application serves as a bridge between:
+- **AudioCodes VoiceAI Connect Enterprise** - A platform for building voice bots over telephony systems
+- **OpenAI Realtime API** - A low-latency multimodal API that enables speech-to-speech conversations
+
+The integration allows phone callers to have natural conversations with an AI assistant powered by OpenAI's latest voice models.
 
 ## Features
 
-- Session initiation and management
-- Audio streaming (simulated)
-- DTMF input handling
-- Activity events processing
-- Connectivity validation
+- Real-time audio streaming in both directions
+- WebSocket-based communication following the AudioCodes Bot API protocol
+- Direct streaming of audio between AudioCodes and OpenAI without intermediate transcription
+- Conversation state management throughout the call lifecycle
 
-## Requirements
+## Prerequisites
 
-Required Python packages are listed in `requirements.txt`. Install them with:
+- Python 3.9+
+- An AudioCodes VoiceAI Connect Enterprise account
+- An OpenAI API key with access to Realtime API
+- Network access to both AudioCodes and OpenAI APIs
 
-```bash
-pip install -r requirements.txt
+## Installation
+
+1. Clone the repository:
+   ```powershell
+   git clone https://github.com/yourusername/real-time-voice-agent.git
+   cd real-time-voice-agent
+   ```
+
+2. Create a virtual environment:
+   ```powershell
+   python -m venv venv
+   .\venv\Scripts\activate
+   ```
+
+3. Install dependencies:
+   ```powershell
+   pip install -r requirements.txt
+   ```
+
+4. Set your OpenAI API key:
+   ```powershell
+   $env:OPENAI_API_KEY="your-api-key-here"
+   ```
+
+## Usage
+
+1. Start the server:
+   ```powershell
+   python -m app.main
+   ```
+
+2. Configure AudioCodes VoiceAI Connect Enterprise:
+   - Set the bot type to "ac-api"
+   - Set the botUrl to your server's WebSocket endpoint (e.g., `wss://your-server.com/ws`)
+   - Set directSTT and directTTS to true
+
+3. Make a test call to your AudioCodes phone number
+
+## Configuration
+
+The application can be configured using environment variables:
+
+- `OPENAI_API_KEY` - Your OpenAI API key (required)
+- `OPENAI_REALTIME_MODEL` - The model to use for real-time conversations (default: `gpt-4o-realtime-preview-2024-12-17`)
+- `PORT` - The port to run the server on (default: 8000)
+
+## Architecture
+
+The application follows a modular architecture:
+
+- `app/main.py` - FastAPI application entry point
+- `app/bot/` - OpenAI Realtime API integration
+- `app/handlers/` - AudioCodes WebSocket message handlers
+- `app/models/` - Data models and conversation state management
+- `app/config/` - Configuration and constants
+
+## Development
+
+### Adding New Features
+
+1. Implement new handlers in the appropriate modules
+2. Register handlers in the WebSocketManager
+3. Update model schemas if needed
+
+### Running Tests
+
+```powershell
+pytest
 ```
 
-## Running the Server
+## License
 
-Start the server with:
-
-```bash
-python run.py
-```
-
-The server will start on `http://localhost:8000`. The WebSocket endpoint is available at `ws://localhost:8000/ws`. A health check endpoint is available at `http://localhost:8000/health`.
-
-## Running the Client
-
-Once the server is running, you can test it with the client:
-
-```bash
-python client.py
-```
-
-The client will:
-1. Initiate a session
-2. Simulate a call start
-3. Demonstrate audio streaming
-4. Send DTMF digits
-5. End the session
-
-## Supported Message Types
-
-### Server Handling
-- `session.initiate` - Initial session creation
-- `session.resume` - Session reconnection
-- `userStream.start` - Start of audio streaming
-- `userStream.chunk` - Audio data chunks
-- `userStream.stop` - End of audio streaming
-- `activities` - Various activity events
-- `session.end` - End of conversation
-- `connection.validate` - Connectivity validation
-
-### Client Sending
-- `session.initiate` - Request session creation
-- `activities` (call start) - Simulate call initiation
-- `userStream.start`, `userStream.chunk`, `userStream.stop` - Audio streaming sequence
-- `activities` (DTMF) - Send button press signals
-- `session.end` - End the conversation
-
-## API Documentation
-
-This implementation follows the AudioCodes Bot API specification for real-time voice agents. For more details, refer to the official [AudioCodes documentation](https://techdocs.audiocodes.com/voice-ai-connect/#Bot-API/ac-bot-api-mode-websocket.htm).
-
-## Project Structure
-
-```
-.
-├── app/                  # Server implementation
-│   ├── config/           # Configuration files
-│   ├── handlers/         # Message type handlers
-│   ├── models/           # Data models
-│   ├── services/         # Business logic
-│   ├── __init__.py
-│   ├── main.py           # Main FastAPI application
-│   └── websocket_manager.py # WebSocket connection manager
-├── tests/                # Test directory
-├── static/               # Static assets
-├── client.py             # Test client implementation
-├── run.py                # Server startup script
-├── requirements.txt      # Package dependencies
-└── README.md             # This file
-``` 
+[MIT](LICENSE) 

@@ -10,16 +10,33 @@ The server handles incoming WebSocket connections, routes messages to appropriat
 handlers, and maintains conversation state throughout the call session.
 """
 
+import os
+from pathlib import Path
+
+import dotenv
 from fastapi import FastAPI, WebSocket
 
 from app.config.logging_config import configure_logging
 from app.websocket_manager import WebSocketManager
 
+# Load environment variables from .env file if it exists
+env_path = Path(".") / ".env"
+if env_path.exists():
+    dotenv.load_dotenv(env_path)
+
 # Configure logging
 logger = configure_logging()
 
+# Get configuration from environment variables
+PORT = int(os.getenv("PORT", "8000"))
+HOST = os.getenv("HOST", "0.0.0.0")
+
 # Create FastAPI application
-app = FastAPI()
+app = FastAPI(
+    title="Real-Time Voice Agent",
+    description="Integration between AudioCodes VoiceAI Connect and OpenAI Realtime API",
+    version="1.0.0",
+)
 
 # Create WebSocket manager
 websocket_manager = WebSocketManager()
@@ -50,11 +67,29 @@ async def health_check():
     This endpoint can be used by load balancers or monitoring tools
     to verify the service is running and responsive.
     """
-    return {"status": "healthy"}
+    return {"status": "healthy", "openai_api_key_configured": bool(os.getenv("OPENAI_API_KEY"))}
+
+
+@app.get("/")
+async def root():
+    """Root endpoint to display basic information about the API.
+
+    Returns:
+        dict: Basic information about the API and its purpose.
+    """
+    return {
+        "name": "Real-Time Voice Agent",
+        "description": "Integration between AudioCodes VoiceAI Connect and OpenAI Realtime API",
+        "version": "1.0.0",
+        "endpoints": {
+            "/ws": "WebSocket endpoint for AudioCodes VoiceAI Connect",
+            "/health": "Health check endpoint",
+        },
+    }
 
 
 if __name__ == "__main__":
     import uvicorn
 
-    logger.info("Starting AC Server on http://0.0.0.0:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    logger.info(f"Starting server on http://{HOST}:{PORT}")
+    uvicorn.run(app, host=HOST, port=PORT)
