@@ -364,16 +364,19 @@ async def test_multiple_messages_handling():
     for handler_name in websocket_manager.handlers:
         websocket_manager.handlers[handler_name] = AsyncMock(return_value=None)
     
-    # Run test
-    await websocket_manager.handle_websocket(websocket)
-    
-    # Verify all handlers were called
-    assert websocket_manager.handlers["connection.validate"].call_count == 1
-    assert websocket_manager.handlers["session.initiate"].call_count == 1
-    assert websocket_manager.handlers["userStream.start"].call_count == 1
-    assert websocket_manager.handlers["userStream.chunk"].call_count == 1
-    assert websocket_manager.handlers["userStream.stop"].call_count == 1
-    assert websocket_manager.handlers["session.end"].call_count == 1
-    
-    # Verify websocket was closed at the end
-    websocket.close.assert_called_once() 
+    # We need to patch the function in the websocket_manager module where it's used directly
+    with patch('app.websocket_manager.handle_user_stream_chunk', AsyncMock(return_value=None)) as mock_chunk_handler:
+        # Run test
+        await websocket_manager.handle_websocket(websocket)
+        
+        # Verify all handlers were called
+        assert websocket_manager.handlers["connection.validate"].call_count == 1
+        assert websocket_manager.handlers["session.initiate"].call_count == 1
+        assert websocket_manager.handlers["userStream.start"].call_count == 1
+        # Check the directly patched function instead
+        assert mock_chunk_handler.call_count == 1
+        assert websocket_manager.handlers["userStream.stop"].call_count == 1
+        assert websocket_manager.handlers["session.end"].call_count == 1
+        
+        # Verify websocket was closed at the end
+        websocket.close.assert_called_once() 
