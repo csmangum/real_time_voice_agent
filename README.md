@@ -16,6 +16,7 @@ The integration allows phone callers to have natural conversations with an AI as
 - WebSocket-based communication following the AudioCodes Bot API protocol
 - Direct streaming of audio between AudioCodes and OpenAI without intermediate transcription
 - Conversation state management throughout the call lifecycle
+- **Low-Latency Optimizations** - Minimizes delays for natural conversations
 
 ## Prerequisites
 
@@ -50,9 +51,9 @@ The integration allows phone callers to have natural conversations with an AI as
 
 ## Usage
 
-1. Start the server:
+1. Start the server with optimized settings:
    ```powershell
-   python -m app.main
+   python run.py
    ```
 
 2. Configure AudioCodes VoiceAI Connect Enterprise:
@@ -62,6 +63,11 @@ The integration allows phone callers to have natural conversations with an AI as
 
 3. Make a test call to your AudioCodes phone number
 
+4. Test latency with the included benchmark tool:
+   ```powershell
+   python latency_test.py
+   ```
+
 ## Configuration
 
 The application can be configured using environment variables:
@@ -69,6 +75,20 @@ The application can be configured using environment variables:
 - `OPENAI_API_KEY` - Your OpenAI API key (required)
 - `OPENAI_REALTIME_MODEL` - The model to use for real-time conversations (default: `gpt-4o-realtime-preview-2024-12-17`)
 - `PORT` - The port to run the server on (default: 8000)
+- `HOST` - The host to bind the server to (default: 0.0.0.0)
+- `ENV` - Set to "development" to enable code reloading (default: "production")
+
+## Low-Latency Optimizations
+
+This project includes specific optimizations to minimize latency for real-time voice conversations:
+
+- TCP socket optimizations (disabled Nagle's algorithm)
+- Minimal WebSocket buffering
+- Optimized audio chunk sizes
+- Fast-path processing for audio streams
+- Parallel chunk processing
+
+For detailed information about the latency optimizations, see [LATENCY_OPTIMIZATIONS.md](LATENCY_OPTIMIZATIONS.md).
 
 ## Architecture
 
@@ -85,6 +105,7 @@ The application follows a modular architecture:
 For more detailed information about the system:
 
 - [Documentation](DOC.md) - Comprehensive technical documentation including system overview, architecture details, and key modules
+- [Latency Optimizations](LATENCY_OPTIMIZATIONS.md) - Details about optimizations for low-latency audio streaming
 - [Changelog](CHANGELOG.md) - Complete history of changes and updates to the project
 
 ## Development

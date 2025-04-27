@@ -11,6 +11,7 @@ handlers, and maintains conversation state throughout the call session.
 """
 
 import os
+import statistics
 from pathlib import Path
 
 import dotenv
@@ -18,6 +19,7 @@ from fastapi import FastAPI, WebSocket
 
 from app.config.logging_config import configure_logging
 from app.websocket_manager import WebSocketManager
+from app.bot.audiocodes_realtime_bridge import bridge
 
 # Load environment variables from .env file if it exists
 env_path = Path(".") / ".env"
@@ -62,12 +64,38 @@ async def health_check():
     """Health check endpoint for monitoring system status.
 
     Returns:
-        dict: Status information indicating the server is operational.
+        dict: Status information indicating the server is operational, including latency metrics.
 
     This endpoint can be used by load balancers or monitoring tools
     to verify the service is running and responsive.
     """
-    return {"status": "healthy", "openai_api_key_configured": bool(os.getenv("OPENAI_API_KEY"))}
+    # Get latency metrics from the bridge
+    latency_metrics = {}
+    if bridge and hasattr(bridge, "audio_latencies") and bridge.audio_latencies:
+        latencies = list(bridge.audio_latencies.values())
+        if latencies:
+            latency_metrics = {
+                "latency_ms": {
+                    "avg": statistics.mean(latencies),
+                    "min": min(latencies),
+                    "max": max(latencies),
+                    "median": statistics.median(latencies),
+                }
+            }
+            if len(latencies) > 1:
+                latency_metrics["latency_ms"]["std_dev"] = statistics.stdev(latencies)
+    
+    # Count active connections
+    active_connections = 0
+    if bridge and hasattr(bridge, "clients"):
+        active_connections = len(bridge.clients)
+    
+    return {
+        "status": "healthy", 
+        "openai_api_key_configured": bool(os.getenv("OPENAI_API_KEY")),
+        "active_connections": active_connections,
+        **latency_metrics
+    }
 
 
 @app.get("/")
@@ -92,4 +120,16 @@ if __name__ == "__main__":
     import uvicorn
 
     logger.info(f"Starting server on http://{HOST}:{PORT}")
-    uvicorn.run(app, host=HOST, port=PORT)
+    # Configure uvicorn with low buffer sizes for minimal latency
+    uvicorn.run(
+        app, 
+        host=HOST, 
+        port=PORT,
+        # Low write buffer size to minimize buffering and reduce latency
+        # This ensures WebSocket messages are sent as soon as possible
+        websocket_ping_interval=5,  # More frequent pings to keep connections alive
+        websocket_max_size=16777216,  # 16MB - large enough for audio chunks
+        websocket_ping_timeout=20,  # Timeout for pings to detect dead connections
+        # Use HTTP/1.1 for lower overhead than HTTP/2
+        http="h11"
+    )

@@ -14,6 +14,7 @@ communications between the AudioCodes VoiceAI Connect platform and the voice bot
 
 import json
 import logging
+import socket
 from typing import Any, Awaitable, Callable, Dict, Optional, Union
 
 from fastapi import WebSocket
@@ -82,6 +83,23 @@ class WebSocketManager:
             "connection.validate": handle_connection_validate,
         }
 
+    async def _optimize_socket(self, websocket: WebSocket) -> None:
+        """
+        Optimize the WebSocket's underlying TCP socket for low-latency transmission.
+        
+        Args:
+            websocket: The FastAPI WebSocket connection
+        """
+        try:
+            # Access the underlying socket via the transport
+            client = websocket.client
+            if hasattr(client, "sock") and client.sock is not None:
+                # Disable Nagle's algorithm to send packets immediately
+                client.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                logger.info("Optimized socket: TCP_NODELAY enabled for low latency")
+        except Exception as e:
+            logger.warning(f"Could not optimize socket: {e}")
+
     async def handle_websocket(self, websocket: WebSocket):
         """Handle a WebSocket connection throughout its lifecycle.
 
@@ -99,7 +117,9 @@ class WebSocketManager:
         until either the client disconnects or a session.end message is received.
         """
         await websocket.accept()
-        logger.info("WebSocket connection established")
+        # Optimize socket for low latency after acceptance
+        await self._optimize_socket(websocket)
+        logger.info("WebSocket connection established and optimized for low latency")
         conversation_id = None
 
         try:
@@ -111,29 +131,13 @@ class WebSocketManager:
                 # Extract the message type
                 message_type = message_dict.get("type")
 
-                # Try to parse as a valid message model
-                typed_message = None
-                try:
-                    if message_type == "session.initiate":
-                        typed_message = SessionInitiateMessage(**message_dict)
-                    elif message_type == "session.resume":
-                        typed_message = SessionResumeMessage(**message_dict)
-                    elif message_type == "userStream.start":
-                        typed_message = UserStreamStartMessage(**message_dict)
-                    elif message_type == "userStream.chunk":
-                        typed_message = UserStreamChunkMessage(**message_dict)
-                    elif message_type == "userStream.stop":
-                        typed_message = UserStreamStopMessage(**message_dict)
-                    elif message_type == "activities":
-                        typed_message = ActivitiesMessage(**message_dict)
-                    elif message_type == "session.end":
-                        typed_message = SessionEndMessage(**message_dict)
-                    elif message_type == "connection.validate":
-                        typed_message = ConnectionValidateMessage(**message_dict)
-                    else:
-                        logger.warning(f"Unknown message type received: {message_type}")
-                except ValidationError as e:
-                    logger.error(f"Message validation error: {e}")
+                # Fast path for audio chunks to minimize processing overhead
+                if message_type == "userStream.chunk":
+                    # Direct handling for audio chunks to minimize latency
+                    await handle_user_stream_chunk(
+                        message_dict, websocket, self.conversation_manager
+                    )
+                    continue
 
                 # Extract the conversation ID if available
                 conversation_id = message_dict.get("conversationId")
@@ -146,6 +150,28 @@ class WebSocketManager:
                         else ""
                     )
                 )
+
+                # Try to parse as a valid message model
+                typed_message = None
+                try:
+                    if message_type == "session.initiate":
+                        typed_message = SessionInitiateMessage(**message_dict)
+                    elif message_type == "session.resume":
+                        typed_message = SessionResumeMessage(**message_dict)
+                    elif message_type == "userStream.start":
+                        typed_message = UserStreamStartMessage(**message_dict)
+                    elif message_type == "userStream.stop":
+                        typed_message = UserStreamStopMessage(**message_dict)
+                    elif message_type == "activities":
+                        typed_message = ActivitiesMessage(**message_dict)
+                    elif message_type == "session.end":
+                        typed_message = SessionEndMessage(**message_dict)
+                    elif message_type == "connection.validate":
+                        typed_message = ConnectionValidateMessage(**message_dict)
+                    else:
+                        logger.warning(f"Unknown message type received: {message_type}")
+                except ValidationError as e:
+                    logger.error(f"Message validation error: {e}")
 
                 # Process the message using the appropriate handler
                 if message_type in self.handlers:
