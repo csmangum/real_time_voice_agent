@@ -80,6 +80,13 @@ The application follows a modular architecture:
 - `app/models/` - Data models and conversation state management
 - `app/config/` - Configuration and constants
 
+## Documentation
+
+For more detailed information about the system:
+
+- [Documentation](DOC.md) - Comprehensive technical documentation including system overview, architecture details, and key modules
+- [Changelog](CHANGELOG.md) - Complete history of changes and updates to the project
+
 ## Development
 
 ### Adding New Features
